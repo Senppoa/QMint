@@ -109,10 +109,13 @@ def _normalise_hessian(value: Any, n_atoms: int) -> np.ndarray:
 
 def calculate(task: dict[str, Any], calculator: Any, hessian_mode: str) -> dict[str, Any]:
     try:
-        import torch
-
         threads = max(1, int(task.get("num_threads", 1)))
-        torch.set_num_threads(threads)
+        try:
+            import torch
+        except ModuleNotFoundError:
+            torch = None
+        if torch is not None:
+            torch.set_num_threads(threads)
         os.environ["OMP_NUM_THREADS"] = str(threads)
         os.environ["MKL_NUM_THREADS"] = str(threads)
         atoms = _atoms(task)
