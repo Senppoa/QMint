@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmint"
+version = "0.2.0"
+description = "Quantum-chemistry interfaces for machine-learning interatomic potentials"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Senppoa", email = "tangkunmail@163.com" },
+]
+keywords = ["Gaussian", "ORCA", "ASE", "machine-learning-potential", "computational-chemistry"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Chemistry",
+]
+dependencies = [
+  "ase>=3.22",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+fairchem = ["fairchem-core"]
+mace = ["mace-torch"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+qmint = "qmint.cli:main"
+server = "qmint.cli:server_main"
+mlpint = "qmint.interfaces.gaussian:main"
+mlpint-orca = "qmint.interfaces.orca:main"
+mlpint-orca-hessian = "qmint.interfaces.orca_hessian:main"
+
+[project.urls]
+Homepage = "https://github.com/Senppoa/QMint"
+Repository = "https://github.com/Senppoa/QMint"
+Issues = "https://github.com/Senppoa/QMint/issues"
+
+[tool.setuptools.packages.find]
+include = ["qmint*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
