@@ -1,7 +1,7 @@
 %chk=ts2.chk
 %nprocshared=1
 %mem=8GB
-#p opt=(calcfc,recalc=3,ts,noeigen,nomicro) external='mlpint'
+#p opt=(calcfc,recalc=3,ts,noeigen,nomicro) external='qmint-gaussian'
 
 23-ts
 
@@ -44,5 +44,5 @@
 %nprocshared=1
 %mem=8GB
 %nosave
-#p geom=allcheck freq external='mlpint'
+#p geom=allcheck freq external='qmint-gaussian'
 

@@ -80,12 +80,14 @@ qmint stop
 qmint start --model orbmol-v2 --backend orb --gpu --hessian analytic
 ```
 
+命令简写为：`-m` 对应 `--model`，`-b` 对应 `--backend`，`-n` 对应 `--workers`，`-g` 对应 `--gpu`，`-d` 对应 `--debug`。
+
 ## Gaussian
 
-在 Gaussian Route Section 中将 `mlpint` 设为 External 程序：
+在 Gaussian Route Section 中将 `qmint-gaussian` 设为 External 程序：
 
 ```text
-# opt external='mlpint'
+# opt external='qmint-gaussian'
 ```
 
 运行 Gaussian 前启动 QMint：
@@ -101,19 +103,19 @@ QMint 按 Gaussian External 格式写回能量、梯度、电学属性占位值�
 
 ## ORCA
 
-使用 `mlpint-orca` 计算 ORCA ExtOpt 的能量和梯度：
+使用 `qmint-orca` 计算 ORCA ExtOpt 的能量和梯度：
 
 ```text
 ! ExtOpt
 %method
-  ProgExt "/absolute/path/to/mlpint-orca"
+  ProgExt "/absolute/path/to/qmint-orca"
 end
 ```
 
-`mlpint-orca-hessian` 会写入 `.engrad` 和 `.hess` 文件，也可以直接读取 XYZ 文件：
+`qmint-orca-hessian` 会写入 `.engrad` 和 `.hess` 文件，也可以直接读取 XYZ 文件：
 
 ```bash
-mlpint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \
+qmint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \
   --threads 4 --output structure.hess
 ```
 

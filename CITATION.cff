@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: Tang
     given-names: Kun
-version: 0.2.2
+version: 0.1.0
 date-released: 2026-08-24
 license: MIT
 repository-code: "https://github.com/Senppoa/QMint"

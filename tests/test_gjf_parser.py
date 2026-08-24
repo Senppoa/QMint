@@ -8,7 +8,7 @@ from integration_model_smoke import read_first_gaussian_geometry
 class GaussianGeometryParserTests(unittest.TestCase):
     def test_reads_first_link_cartesian_geometry(self):
         content = """%chk=a.chk
-#p external='mlpint'
+#p external='qmint-gaussian'
 
 title
 
@@ -29,4 +29,3 @@ H 0 0 1
 
 if __name__ == "__main__":
     unittest.main()
-

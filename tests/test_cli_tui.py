@@ -21,6 +21,26 @@ class CliAndTuiTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
                 parser.parse_args(arguments)
 
+    def test_start_short_options_are_supported(self):
+        args = _parser().parse_args(
+            [
+                "start",
+                "-m",
+                "uma-s",
+                "-b",
+                "fairchem",
+                "-n",
+                "2",
+                "-g",
+                "0",
+                "-d",
+            ]
+        )
+        self.assertEqual(
+            (args.model, args.backend, args.workers, args.gpu, args.debug),
+            ("uma-s", "fairchem", 2, "0", True),
+        )
+
     def test_gpu_arguments_cover_cpu_single_and_multiple_cards(self):
         self.assertIsNone(_gpu_argument("cpu", "auto"))
         self.assertEqual(_gpu_argument("single", "2,3"), "2")

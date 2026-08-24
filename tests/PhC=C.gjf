@@ -1,7 +1,7 @@
 %chk=PhC=C.chk
 %nprocshared=1
 %mem=8GB
-#p opt=(calcfc,nomicro) external='mlpint'
+#p opt=(calcfc,nomicro) external='qmint-gaussian'
 
 int1
 
@@ -28,5 +28,5 @@ int1
 %nprocshared=1
 %mem=8GB
 %nosave
-#p geom=allcheck freq external='mlpint'
+#p geom=allcheck freq external='qmint-gaussian'
 

@@ -80,12 +80,14 @@ qmint stop
 qmint start --model orbmol-v2 --backend orb --gpu --hessian analytic
 ```
 
+The short options are `-m` for `--model`, `-b` for `--backend`, `-n` for `--workers`, `-g` for `--gpu`, and `-d` for `--debug`.
+
 ## Gaussian
 
-Use `mlpint` as the Gaussian External program:
+Use `qmint-gaussian` as the Gaussian External program:
 
 ```text
-# opt external='mlpint'
+# opt external='qmint-gaussian'
 ```
 
 Start QMint before running Gaussian:
@@ -101,19 +103,19 @@ QMint writes the energy, gradient, electric-property placeholders, and packed lo
 
 ## ORCA
 
-Use `mlpint-orca` for ORCA ExtOpt energy and gradient calculations:
+Use `qmint-orca` for ORCA ExtOpt energy and gradient calculations:
 
 ```text
 ! ExtOpt
 %method
-  ProgExt "/absolute/path/to/mlpint-orca"
+  ProgExt "/absolute/path/to/qmint-orca"
 end
 ```
 
-`mlpint-orca-hessian` writes `.engrad` and `.hess` files. It can also run on an XYZ file:
+`qmint-orca-hessian` writes `.engrad` and `.hess` files. It can also run on an XYZ file:
 
 ```bash
-mlpint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \
+qmint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \
   --threads 4 --output structure.hess
 ```
 

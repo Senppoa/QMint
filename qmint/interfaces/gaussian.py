@@ -14,7 +14,7 @@ BOHR_TO_ANGSTROM = 0.529177210903
 
 def main() -> None:
     if len(sys.argv) < 6:
-        raise SystemExit("Gaussian must call mlpint with its five External interface files")
+        raise SystemExit("Gaussian must call qmint-gaussian with its five External interface files")
     input_file, output_file, message_file = sys.argv[-5:-2]
     lines = Path(input_file).read_text(encoding="utf-8").splitlines()
     count, derivative, charge, multiplicity = (int(value) for value in lines[0].split())

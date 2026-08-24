@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qmint"
-version = "0.2.2"
+version = "0.1.0"
 description = "Quantum-chemistry interfaces for machine-learning interatomic potentials"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,9 +35,9 @@ dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 qmint = "qmint.cli:main"
-mlpint = "qmint.interfaces.gaussian:main"
-mlpint-orca = "qmint.interfaces.orca:main"
-mlpint-orca-hessian = "qmint.interfaces.orca_hessian:main"
+qmint-gaussian = "qmint.interfaces.gaussian:main"
+qmint-orca = "qmint.interfaces.orca:main"
+qmint-orca-hessian = "qmint.interfaces.orca_hessian:main"
 
 [project.urls]
 Homepage = "https://github.com/Senppoa/QMint"
