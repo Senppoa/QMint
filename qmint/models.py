@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
+import tempfile
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +22,9 @@ class ModelSpec:
     path: Path
     description: str = ""
     builtin: bool = False
+    head: str | None = None
+    download_url: str | None = None
+    sha256: str | None = None
 
 
 BUILTIN_MODELS: dict[str, dict[str, Any]] = {
@@ -44,24 +51,58 @@ BUILTIN_MODELS: dict[str, dict[str, Any]] = {
         "filename": "MACE-omol-0-extra-large-1024.model",
         "aliases": (),
         "description": "MACE OMol extra-large",
+        "head": "omol",
+        "download_url": (
+            "https://github.com/ACEsuit/mace-foundations/releases/download/"
+            "mace_omol_0/MACE-omol-0-extra-large-1024.model"
+        ),
+        "sha256": "9b64b4fd5153ca578c694abc57806d8111050de6ff652e695c9b525bc4d36469",
     },
     "mace-polar-m": {
         "backend": "mace",
         "filename": "MACE-POLAR-1-M.model",
         "aliases": (),
         "description": "MACE POLAR medium",
+        "download_url": (
+            "https://github.com/ACEsuit/mace-foundations/releases/download/"
+            "mace_polar_1/MACE-POLAR-1-M.model"
+        ),
+        "sha256": "fab8b8713c832f31a2a853aaa22fd638be8a369cbf5095e6b3e982a18d10e93a",
     },
     "mace-polar-l": {
         "backend": "mace",
         "filename": "MACE-POLAR-1-L.model",
         "aliases": (),
         "description": "MACE POLAR large",
+        "download_url": (
+            "https://github.com/ACEsuit/mace-foundations/releases/download/"
+            "mace_polar_1/MACE-POLAR-1-L.model"
+        ),
+        "sha256": "9f65f8dc6ddaff1d631e299cb531376a7da5e68d1bef04f34a2d5073d5ef114b",
+    },
+    "mace-mh-1": {
+        "backend": "mace",
+        "filename": "mace-mh-1.model",
+        "aliases": (),
+        "description": "MACE multi-head model (OMol head)",
+        "head": "omol",
+    },
+    "deepest-os": {
+        "backend": "mace",
+        "filename": "deepest-os.model",
+        "aliases": (),
+        "description": "DeepEst-OS MACE model",
     },
     "orbmol-v2": {
         "backend": "orb",
         "filename": "orbmol-v2-teqabfhg-20260523.ckpt",
         "aliases": ("orb-mol-v2", "orbmol-v2-teqabfhg-20260523.ckpt"),
         "description": "OrbMol v2",
+        "download_url": (
+            "https://orbitalmaterials-public-models.s3.us-west-1.amazonaws.com/"
+            "forcefields/orbmol-v2-teqabfhg-20260523.ckpt"
+        ),
+        "sha256": "3dbef70b5fdc9124392181b0d8686c79f1c02bf5fefcb878a4eaa51d03e4f5e8",
     },
 }
 
@@ -88,6 +129,9 @@ def list_models(config: dict[str, Any]) -> list[ModelSpec]:
             path=root / data["filename"],
             description=data["description"],
             builtin=True,
+            head=data.get("head"),
+            download_url=data.get("download_url"),
+            sha256=data.get("sha256"),
         )
         for name, data in BUILTIN_MODELS.items()
     ]
@@ -98,6 +142,7 @@ def list_models(config: dict[str, Any]) -> list[ModelSpec]:
                 backend=data["backend"],
                 path=Path(data["path"]).expanduser().resolve(),
                 description=data.get("description", "Custom model"),
+                head=data.get("head"),
             )
         )
     return models
@@ -122,6 +167,9 @@ def resolve_model(
             model_dir(config) / data["filename"],
             data["description"],
             True,
+            data.get("head"),
+            data.get("download_url"),
+            data.get("sha256"),
         )
 
     custom = config.get("custom_models", {}).get(reference)
@@ -136,6 +184,8 @@ def resolve_model(
             selected_backend,
             Path(custom["path"]).expanduser().resolve(),
             custom.get("description", "Custom model"),
+            False,
+            custom.get("head"),
         )
 
     if backend is None:
@@ -148,8 +198,54 @@ def resolve_model(
     return ModelSpec(Path(reference).stem, backend, Path(reference).expanduser().resolve())
 
 
+def verify_model(path: Path, sha256: str | None = None) -> bool:
+    """Return whether a model exists and matches its optional SHA-256 digest."""
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+    if not sha256:
+        return True
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest().lower() == sha256.lower()
+
+
+def download_model(spec: ModelSpec, destination: Path | None = None) -> Path:
+    """Download a built-in model atomically and verify its digest."""
+    if not spec.download_url:
+        raise ValueError(
+            f"{spec.name} has no automatic download URL; download it manually and place it at {spec.path}"
+        )
+    target = (destination or spec.path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if verify_model(target, spec.sha256):
+        return target
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temporary = Path(temporary_name)
+    try:
+        request = urllib.request.Request(
+            spec.download_url, headers={"User-Agent": "QMint model downloader"}
+        )
+        with os.fdopen(descriptor, "wb") as output, urllib.request.urlopen(
+            request, timeout=60
+        ) as response:
+            shutil.copyfileobj(response, output, length=1024 * 1024)
+        if not verify_model(temporary, spec.sha256):
+            raise ValueError(f"Downloaded {spec.name} failed SHA-256 verification")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target
+
+
 def add_custom_model(
-    config: dict[str, Any], name: str, path: str, backend: str, description: str = ""
+    config: dict[str, Any],
+    name: str,
+    path: str,
+    backend: str,
+    description: str = "",
+    head: str | None = None,
 ) -> None:
     if name in aliases():
         raise ValueError(f"{name!r} is reserved by a built-in model")
@@ -159,4 +255,5 @@ def add_custom_model(
         "path": str(Path(path).expanduser().resolve()),
         "backend": backend,
         "description": description or "Custom model",
+        "head": head,
     }

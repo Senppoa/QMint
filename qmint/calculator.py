@@ -50,7 +50,8 @@ def load_calculator(spec: ModelSpec, device: str, hessian_mode: str = "numeric")
             from mace.calculators import MACECalculator
         except ModuleNotFoundError as exc:
             raise ModuleNotFoundError("mace backend is unavailable; install mace-torch") from exc
-        return MACECalculator(model_paths=str(spec.path), device=device), device
+        options = {"head": spec.head} if spec.head else {}
+        return MACECalculator(model_paths=str(spec.path), device=device, **options), device
 
     if spec.backend == "orb":
         try:

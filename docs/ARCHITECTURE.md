@@ -10,3 +10,4 @@ The server state file contains a random one-process token and is mode `0600`. Ad
 
 To add VASP, implement a module under `qmint/interfaces/` that converts VASP's calculator callback or socket contract into the existing task dictionary. The model registry and server do not need to change.
 
+Running `qmint` without a subcommand opens the curses TUI. On first configuration only, the TUI offers verified public model downloads; subsequent sessions never retry them automatically. Both the TUI and CLI call the same `qmint.server.start` function with model, worker, GPU, Hessian and debug settings. Workers started by the TUI are stopped in a `finally` block when the interface exits so model memory is released.

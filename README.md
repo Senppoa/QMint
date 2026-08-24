@@ -1,19 +1,23 @@
 # QMint
 
-QMint（Quantum Machine-Learning Interface）是一个面向量子化学程序的本地模型路由器：它把 ASE 兼容的机器学习势函数包装为一个多 worker 服务，并通过轻量适配器向 Gaussian 和 ORCA 提供能量、梯度及 Hessian。服务核心与程序适配器解耦，后续可以在 `qmint/interfaces/` 中增加 VASP 等接口。
+English | [中文](docs/README_zh.md)
 
-作者：Senppoa  · 版本：0.2.0  · 协议：[MIT](LICENSE)
+QMint (Quantum Machine-Learning Interface) is a local model router for quantum-chemistry software. It exposes ASE-compatible machine-learning potentials through one multi-worker service and lightweight adapters for Gaussian and ORCA. The server is independent of the client program, so integrations such as VASP can be added without changing model execution.
 
-## 主要能力
+Author: Kun Tang · Version: 0.2.1 · License: [MIT](LICENSE)
 
-- 单一多 worker 服务：`server` 是兼容别名，不再维护重复的 `server-multi` 源码。
-- 终端模型切换：`qmint models`、`qmint use` / `qmint switch`、`qmint start`。
-- 无第三方 TUI 依赖：`qmint tui` 提供键盘导航、服务启停、GPU/Hessian 选项和作者信息。
-- 后端：Fairchem/UMA、MACE、OrbMol-v2；每个后端仍建议使用隔离的 Conda 环境。
-- Gaussian External、ORCA ExtOpt、ORCA Hessian standalone 接口。
-- 本地服务状态文件权限为 `0600`，每次启动生成随机会话令牌，避免同机其他进程伪造任务。
+## Highlights
 
-## 安装
+- One multi-worker service replaces the former duplicate `server` and `server-multi` implementations.
+- Running `qmint` with no subcommand opens a guided TUI. It configures model, workers, CPU/single-GPU/multi-GPU execution, GPU IDs, Hessian mode, and debug logging.
+- On first initialization only, QMint offers optional downloads for MACE-OMol, MACE-POLAR-M/L, and OrbMol-v2. UMA is access-gated and must be downloaded manually.
+- Persistent model selection from the terminal with `qmint models`, `qmint use`, and `qmint switch`.
+- Fairchem/UMA, MACE, and OrbMol-v2 backends.
+- Gaussian External, ORCA ExtOpt, and standalone ORCA Hessian adapters.
+- A loopback-only authenticated protocol with a random token and `0600` state files.
+- Numeric and backend-provided analytic Hessian paths.
+
+## Installation
 
 ```bash
 git clone https://github.com/Senppoa/QMint.git
@@ -21,55 +25,63 @@ cd QMint
 python -m pip install -e .
 ```
 
-基础安装提供协议、CLI 和适配器；实际推理后端按需安装：
+Install only the backend required by the model environment:
 
 ```bash
-python -m pip install fairchem-core   # UMA
-python -m pip install mace-torch      # MACE
-python -m pip install "git+https://github.com/orbital-materials/orb-models.git"  # OrbMol-v2
-python -m pip install orb-hessian     # 可选：解析 Hessian
+python -m pip install fairchem-core
+python -m pip install mace-torch
+python -m pip install "git+https://github.com/orbital-materials/orb-models.git"
+python -m pip install "git+https://github.com/Senppoa/orb-hessian.git"  # optional analytic OrbMol Hessian support
 ```
 
-三种后端的 PyTorch/e3nn 依赖可能冲突，请分别创建环境。模型文件放到 `MLP_MODEL_DIR`，或通过 `qmint config set model-dir /path/to/models` 指定目录。
+Fairchem, MACE, and OrbMol may require incompatible PyTorch/e3nn versions. Separate Conda environments are recommended. Place weights in `MLP_MODEL_DIR`, or configure a default directory:
 
-## 从终端切换模型
+```bash
+qmint config set model-dir /path/to/models
+```
+
+## Model Switching
 
 ```bash
 qmint models
 qmint use uma-m
 qmint switch mace-omol
-qmint model add my-mace /data/models/my.model --backend mace --description "fine-tuned MACE"
+
+qmint model add my-mace /data/models/my.model \
+  --backend mace --description "fine-tuned MACE"
 qmint use my-mace
+
 qmint start --gpu 0,1 --workers 2
 qmint status
 qmint stop
 ```
 
-`qmint start` 的模型、worker、GPU 和 Hessian 参数都可以临时覆盖持久化配置：
+Arguments passed to `qmint start` override persistent settings for that invocation:
 
 ```bash
 qmint start -m orbmol-v2 -b orb -g --hessian analytic
 ```
 
-GPU 参数：不写 `--gpu` 表示 CPU；`--gpu` 自动使用所有可见 GPU；`--gpu 0,2` 使用指定卡。`server start ...` 与 `server exit` 仍可用于旧脚本。
+Omit `--gpu` for CPU execution, use `--gpu` without a value for all visible GPUs, or pass a list such as `--gpu 0,2`. The historical `server start ...` and `server exit` commands remain available as compatibility entry points.
 
-## TUI
+## Terminal UI
 
 ```bash
-qmint tui
+qmint        # default: open the TUI
+qmint tui    # explicit equivalent
 ```
 
-方向键或 `j/k` 选择模型，Enter 启动服务，`s` 停止服务，`g` 在 CPU/自动 GPU 间切换，`h` 切换数值/解析 Hessian，`q` 退出。界面显示工具名称、版本、作者、后端、模型文件状态和当前服务状态。
+The first run shows a download checklist for models with public URLs. The setup screen displays an ASCII QMint logo, author `Kun Tang`, and the citation `Tang, K. (2026). QMint: Quantum Machine-Learning Interface.` See [CITATION.cff](CITATION.cff) for the machine-readable citation.
+
+Use the guided fields to choose a model, worker count, CPU/single-GPU/multi-GPU mode, GPU IDs (for example `0,1` or `auto`), Hessian mode, and debug logging. These are the same parameters accepted by `qmint start`. Enter starts the service and `s` stops it. Exiting with `q`, Esc, `Ctrl-C`, or an error always stops all TUI-owned model workers so their CPU/GPU memory is released. Downloads are never retried automatically after the initial configuration; missing files are reported with their expected paths.
 
 ## Gaussian
 
-将 `mlpint` 配置为 Gaussian External 脚本，在 Route Section 使用：
+Install QMint so that the `mlpint` console entry point is visible to Gaussian, then use it as an External program:
 
 ```text
 # opt external='mlpint'
 ```
-
-先在对应环境启动 QMint：
 
 ```bash
 qmint use uma-s
@@ -78,11 +90,11 @@ g16 molecule.gjf
 qmint stop
 ```
 
-Gaussian 传入的 Bohr 坐标会由适配器转换为 ASE 使用的 Å；梯度和下三角 Hessian 按 Gaussian External 格式写回。线程数读取 `MLP_THREADS`，其次读取 `OMP_NUM_THREADS`。
+The adapter converts Gaussian coordinates from Bohr to angstrom and writes energy, gradient, dummy electric properties, and the packed lower-triangular Hessian in Gaussian External format. Worker threads are selected from `MLP_THREADS`, then `OMP_NUM_THREADS`, and default to one.
 
 ## ORCA
 
-`mlpint-orca` 用于 ORCA `ExtOpt` 能量+梯度：
+Use `mlpint-orca` as an ORCA ExtOpt program for energy and gradients:
 
 ```text
 ! ExtOpt
@@ -91,27 +103,28 @@ Gaussian 传入的 Bohr 坐标会由适配器转换为 ASE 使用的 Å；梯度
 end
 ```
 
-`mlpint-orca-hessian` 同时写 `.engrad` 和 `.hess`，也支持独立计算：
+`mlpint-orca-hessian` writes both `.engrad` and `.hess` files and also supports standalone execution:
 
 ```bash
-mlpint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 --threads 4 -o structure.hess
+mlpint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \
+  --threads 4 --output structure.hess
 ```
 
-解析 Hessian 需要后端支持；OrbMol-v2 还需要 `orb-hessian`，并用 `qmint start --hessian analytic` 启动。
+Analytic Hessians require calculator support. OrbMol-v2 additionally requires Kun Tang's [`orb-hessian`](https://github.com/Senppoa/orb-hessian) patch and a server started with `--hessian analytic`.
 
-## 配置与环境变量
+## Configuration
 
-| 项目 | 默认值 |
+| Setting | Default |
 | --- | --- |
-| 配置文件 | `~/.config/qmint/config.json`（可用 `QMINT_CONFIG_HOME` 覆盖） |
-| 模型目录 | `~/.local/share/qmint/models`（`MLP_MODEL_DIR` 优先） |
-| 服务状态 | `/tmp/qmint_<job-id>.json` |
-| 日志 | `~/.local/state/qmint/server.log` |
-| 线程 | `MLP_THREADS` > `OMP_NUM_THREADS` > `1` |
+| Configuration | `~/.config/qmint/config.json` (`QMINT_CONFIG_HOME` overrides it) |
+| Model directory | `~/.local/share/qmint/models` (`MLP_MODEL_DIR` takes precedence) |
+| Server state | `/tmp/qmint_<job-id>.json` |
+| Server log | `~/.local/state/qmint/server.log` |
+| Threads | `MLP_THREADS` > `OMP_NUM_THREADS` > `1` |
 
-服务只监听 `127.0.0.1`。不要把状态文件或模型权重提交到版本库。
+The server listens only on `127.0.0.1`. Do not commit model weights or runtime state files.
 
-## 开发与验证
+## Development
 
 ```bash
 python -m pip install -e '.[dev]'
@@ -119,24 +132,38 @@ python -m unittest discover -s tests -v
 python -m compileall -q qmint
 ```
 
-当前测试覆盖配置/模型注册、认证帧协议、Gaussian/ORCA 文件格式和 ASE 计算任务。真实 Fairchem/MACE/OrbMol 推理需要对应权重和后端环境。
+The fast test suite covers configuration and model registration, authenticated framing, Gaussian/ORCA file handling, unit conversion, and ASE task execution. Real backend tests require the corresponding weights and environment.
 
-## 项目结构
+## Repository Layout
 
 ```text
 qmint/
-  calculator.py       ASE 任务、后端加载、Hessian
-  cli.py              qmint/server 兼容命令与模型切换
-  config.py           持久化用户配置
-  models.py           内置/自定义模型注册表
-  protocol.py         本地认证 Socket 协议
-  server.py           唯一多 worker 服务实现
-  tui.py              curses TUI
-  interfaces/         Gaussian、ORCA 适配器（未来可扩展 VASP）
-tests/                无模型权重的快速回归测试
+  calculator.py       Backend loading, ASE tasks, and Hessians
+  cli.py              QMint CLI and compatibility commands
+  config.py           Persistent user configuration
+  models.py           Built-in and custom model registry
+  protocol.py         Authenticated local socket protocol
+  server.py           The single multi-worker service
+  tui.py              Curses terminal UI
+  interfaces/         Gaussian and ORCA adapters; extension point for VASP
+tests/                Fast regression tests and calculation inputs
 ```
 
-## 许可证
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component boundaries.
 
-QMint 按 MIT License 开源，详见 [LICENSE](LICENSE)。第三方模型、后端和补丁包分别受其自身许可证约束。
+## Model Downloads
 
+The first-run TUI offers these public model URLs:
+
+| Model | URL |
+| --- | --- |
+| MACE-OMol extra-large | [mace-foundations release](https://github.com/ACEsuit/mace-foundations/releases/download/mace_omol_0/MACE-omol-0-extra-large-1024.model) |
+| MACE-POLAR-M | [direct download](https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-M.model) |
+| MACE-POLAR-L | [direct download](https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-L.model) |
+| OrbMol-v2 | [Orbital Materials public bucket](https://orbitalmaterials-public-models.s3.us-west-1.amazonaws.com/forcefields/orbmol-v2-teqabfhg-20260523.ckpt) |
+
+UMA checkpoints are access-gated. Follow the [Fairchem UMA documentation](https://github.com/facebookresearch/fairchem) to download them manually, then place the files in the configured model directory.
+
+## License
+
+QMint is released under the [MIT License](LICENSE). Model weights, calculator backends, and optional patches retain their respective third-party licenses.

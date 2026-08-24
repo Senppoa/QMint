@@ -8,7 +8,7 @@ import sys
 from typing import Sequence
 
 from . import __author__, __version__
-from .config import load_config, save_config
+from .config import config_path, load_config, save_config
 from .models import BACKENDS, add_custom_model, list_models, resolve_model
 from .protocol import server_info, stop_server
 
@@ -47,6 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     add_parser.add_argument("path")
     add_parser.add_argument("--backend", "-b", choices=BACKENDS, required=True)
     add_parser.add_argument("--description", default="")
+    add_parser.add_argument("--head", help="named model head, for example omol")
     model_subcommands.add_parser("list", help="list models")
     model_use_parser = model_subcommands.add_parser("use", help="select the active model")
     model_use_parser.add_argument("model")
@@ -112,7 +113,9 @@ def _set_config(config: dict, key: str, value: str) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if not args.command:
-        _parser().print_help()
+        from .tui import run
+
+        run(first_run=not config_path().exists())
         return 0
     config = load_config()
     try:
@@ -136,7 +139,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             save_config(config)
             print(f"Active model: {config['active_model']} ({spec.backend})")
         elif args.command == "model" and args.model_command == "add":
-            add_custom_model(config, args.name, args.path, args.backend, args.description)
+            add_custom_model(
+                config, args.name, args.path, args.backend, args.description, args.head
+            )
             save_config(config)
             print(f"Registered model: {args.name}")
         elif args.command == "model" and args.model_command == "list":
