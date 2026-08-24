@@ -84,7 +84,7 @@ The short options are `-m` for `--model`, `-b` for `--backend`, `-n` for `--work
 
 ## Gaussian
 
-Use `qmint-gaussian` as the Gaussian External program:
+Installing QMint adds `qmint-gaussian` to the active Python environment. Start Gaussian from that environment and use the command directly:
 
 ```text
 # opt external='qmint-gaussian'
@@ -103,16 +103,26 @@ QMint writes the energy, gradient, electric-property placeholders, and packed lo
 
 ## ORCA
 
-Use `qmint-orca` for ORCA ExtOpt energy and gradient calculations:
+Installing QMint also adds `qmint-orca` and `qmint-orca-hessian` to the active environment. ORCA requires the external optimizer through its `EXTOPTEXE` environment variable. Set it after activating the environment and before starting ORCA:
+
+```bash
+conda activate your-environment
+export EXTOPTEXE="$(command -v qmint-orca)"
+```
+
+The setting applies to the current shell. Add the same `export` command to each batch script, or run it again when you open a new terminal. The ORCA input then needs only:
 
 ```text
 ! ExtOpt
-%method
-  ProgExt "/absolute/path/to/qmint-orca"
-end
 ```
 
-`qmint-orca-hessian` writes `.engrad` and `.hess` files. It can also run on an XYZ file:
+To use the Hessian-capable interface instead, set:
+
+```bash
+export EXTOPTEXE="$(command -v qmint-orca-hessian)"
+```
+
+`qmint-orca-hessian` writes `.engrad` and `.hess` files. It can also run directly on an XYZ file:
 
 ```bash
 qmint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \

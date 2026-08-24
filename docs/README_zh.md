@@ -84,7 +84,7 @@ qmint start --model orbmol-v2 --backend orb --gpu --hessian analytic
 
 ## Gaussian
 
-在 Gaussian Route Section 中将 `qmint-gaussian` 设为 External 程序：
+安装 QMint 后，`qmint-gaussian` 会自动加入当前 Python 环境。从该环境启动 Gaussian，并在 Route Section 中直接使用这个命令：
 
 ```text
 # opt external='qmint-gaussian'
@@ -103,13 +103,23 @@ QMint 按 Gaussian External 格式写回能量、梯度、电学属性占位值�
 
 ## ORCA
 
-使用 `qmint-orca` 计算 ORCA ExtOpt 的能量和梯度：
+安装 QMint 后，`qmint-orca` 和 `qmint-orca-hessian` 也会加入当前环境。ORCA 通过 `EXTOPTEXE` 环境变量查找外部优化器，因此需要在激活环境后、启动 ORCA 前设置一次：
+
+```bash
+conda activate your-environment
+export EXTOPTEXE="$(command -v qmint-orca)"
+```
+
+该设置只对当前 shell 生效。每次打开新终端时需要重新设置；使用作业调度脚本时，也要把同一条 `export` 命令写进脚本。ORCA 输入文件只需要：
 
 ```text
 ! ExtOpt
-%method
-  ProgExt "/absolute/path/to/qmint-orca"
-end
+```
+
+需要 Hessian 接口时，改为：
+
+```bash
+export EXTOPTEXE="$(command -v qmint-orca-hessian)"
 ```
 
 `qmint-orca-hessian` 会写入 `.engrad` 和 `.hess` 文件，也可以直接读取 XYZ 文件：
