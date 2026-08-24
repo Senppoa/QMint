@@ -2,7 +2,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from qmint.cli import main
+from qmint.cli import _parser, main
 from qmint.tui import _gpu_argument, _required_gpu_workers, run as run_tui
 
 
@@ -14,6 +14,12 @@ class CliAndTuiTests(unittest.TestCase):
         ):
             self.assertEqual(main([]), 0)
         run.assert_called_once_with(first_run=True)
+
+    def test_removed_command_aliases_are_rejected(self):
+        parser = _parser()
+        for arguments in (["exit"], ["switch", "uma-s"], ["start", "--np", "2"]):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                parser.parse_args(arguments)
 
     def test_gpu_arguments_cover_cpu_single_and_multiple_cards(self):
         self.assertIsNone(_gpu_argument("cpu", "auto"))

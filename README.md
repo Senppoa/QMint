@@ -2,22 +2,15 @@
 
 English | [中文](docs/README_zh.md)
 
-QMint (Quantum Machine-Learning Interface) is a local model router for quantum-chemistry software. It exposes ASE-compatible machine-learning potentials through one multi-worker service and lightweight adapters for Gaussian and ORCA. The server is independent of the client program, so integrations such as VASP can be added without changing model execution.
+QMint connects machine-learning interatomic potentials to Gaussian and ORCA. It runs an ASE-compatible model as a local service and provides command-line adapters for energy, gradient, and Hessian calculations.
 
-Author: Kun Tang · Version: 0.2.1 · License: [MIT](LICENSE)
+Supported model backends:
 
-## Highlights
+- Fairchem / UMA
+- MACE
+- OrbMol-v2
 
-- One multi-worker service replaces the former duplicate `server` and `server-multi` implementations.
-- Running `qmint` with no subcommand opens a guided TUI. It configures model, workers, CPU/single-GPU/multi-GPU execution, GPU IDs, Hessian mode, and debug logging.
-- On first initialization only, QMint offers optional downloads for MACE-OMol, MACE-POLAR-M/L, and OrbMol-v2. UMA is access-gated and must be downloaded manually.
-- Persistent model selection from the terminal with `qmint models`, `qmint use`, and `qmint switch`.
-- Fairchem/UMA, MACE, and OrbMol-v2 backends.
-- Gaussian External, ORCA ExtOpt, and standalone ORCA Hessian adapters.
-- A loopback-only authenticated protocol with a random token and `0600` state files.
-- Numeric and backend-provided analytic Hessian paths.
-
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/Senppoa/QMint.git
@@ -25,63 +18,77 @@ cd QMint
 python -m pip install -e .
 ```
 
-Install only the backend required by the model environment:
+Install the package required by your model:
 
 ```bash
 python -m pip install fairchem-core
 python -m pip install mace-torch
 python -m pip install "git+https://github.com/orbital-materials/orb-models.git"
-python -m pip install "git+https://github.com/Senppoa/orb-hessian.git"  # optional analytic OrbMol Hessian support
 ```
 
-Fairchem, MACE, and OrbMol may require incompatible PyTorch/e3nn versions. Separate Conda environments are recommended. Place weights in `MLP_MODEL_DIR`, or configure a default directory:
+OrbMol analytic Hessians also require [`orb-hessian`](https://github.com/Senppoa/orb-hessian):
+
+```bash
+python -m pip install "git+https://github.com/Senppoa/orb-hessian.git"
+```
+
+## Configure models
+
+Set the directory that contains model weights:
 
 ```bash
 qmint config set model-dir /path/to/models
 ```
 
-## Model Switching
+You can also set `MLP_MODEL_DIR`. To register a model stored elsewhere:
+
+```bash
+qmint model add my-mace /data/models/my.model \
+  --backend mace --description "fine-tuned MACE"
+```
+
+List available models and select the default:
 
 ```bash
 qmint models
-qmint use uma-m
-qmint switch mace-omol
+qmint use mace-omol
+```
 
-qmint model add my-mace /data/models/my.model \
-  --backend mace --description "fine-tuned MACE"
-qmint use my-mace
+The first TUI run can download the public MACE-OMol, MACE-POLAR-M/L, and OrbMol-v2 weights. Download UMA checkpoints from the [Fairchem repository](https://github.com/facebookresearch/fairchem) and place them in the model directory.
 
-qmint start --gpu 0,1 --workers 2
+## Run QMint
+
+Open the terminal interface:
+
+```bash
+qmint
+```
+
+The TUI controls the model, worker count, CPU or GPU execution, GPU IDs, Hessian mode, and debug logging. It stops the workers it started when you exit.
+
+For scripts, use the CLI directly:
+
+```bash
+qmint start --model mace-omol --gpu 0,1 --workers 2
 qmint status
 qmint stop
 ```
 
-Arguments passed to `qmint start` override persistent settings for that invocation:
+`--gpu` uses all visible GPUs, while `--gpu 0,2` selects specific devices. Omit it for CPU execution. Command-line options override saved settings for the current start:
 
 ```bash
-qmint start -m orbmol-v2 -b orb -g --hessian analytic
+qmint start --model orbmol-v2 --backend orb --gpu --hessian analytic
 ```
-
-Omit `--gpu` for CPU execution, use `--gpu` without a value for all visible GPUs, or pass a list such as `--gpu 0,2`. The historical `server start ...` and `server exit` commands remain available as compatibility entry points.
-
-## Terminal UI
-
-```bash
-qmint        # default: open the TUI
-qmint tui    # explicit equivalent
-```
-
-The first run shows a download checklist for models with public URLs. The setup screen displays an ASCII QMint logo, author `Kun Tang`, and the citation `Tang, K. (2026). QMint: Quantum Machine-Learning Interface.` See [CITATION.cff](CITATION.cff) for the machine-readable citation.
-
-Use the guided fields to choose a model, worker count, CPU/single-GPU/multi-GPU mode, GPU IDs (for example `0,1` or `auto`), Hessian mode, and debug logging. These are the same parameters accepted by `qmint start`. Enter starts the service and `s` stops it. Exiting with `q`, Esc, `Ctrl-C`, or an error always stops all TUI-owned model workers so their CPU/GPU memory is released. Downloads are never retried automatically after the initial configuration; missing files are reported with their expected paths.
 
 ## Gaussian
 
-Install QMint so that the `mlpint` console entry point is visible to Gaussian, then use it as an External program:
+Use `mlpint` as the Gaussian External program:
 
 ```text
 # opt external='mlpint'
 ```
+
+Start QMint before running Gaussian:
 
 ```bash
 qmint use uma-s
@@ -90,11 +97,11 @@ g16 molecule.gjf
 qmint stop
 ```
 
-The adapter converts Gaussian coordinates from Bohr to angstrom and writes energy, gradient, dummy electric properties, and the packed lower-triangular Hessian in Gaussian External format. Worker threads are selected from `MLP_THREADS`, then `OMP_NUM_THREADS`, and default to one.
+QMint writes the energy, gradient, electric-property placeholders, and packed lower-triangular Hessian in Gaussian External format. Set calculator threads with `MLP_THREADS` or `OMP_NUM_THREADS`.
 
 ## ORCA
 
-Use `mlpint-orca` as an ORCA ExtOpt program for energy and gradients:
+Use `mlpint-orca` for ORCA ExtOpt energy and gradient calculations:
 
 ```text
 ! ExtOpt
@@ -103,26 +110,25 @@ Use `mlpint-orca` as an ORCA ExtOpt program for energy and gradients:
 end
 ```
 
-`mlpint-orca-hessian` writes both `.engrad` and `.hess` files and also supports standalone execution:
+`mlpint-orca-hessian` writes `.engrad` and `.hess` files. It can also run on an XYZ file:
 
 ```bash
 mlpint-orca-hessian --xyz structure.xyz --charge 0 --mult 1 \
   --threads 4 --output structure.hess
 ```
 
-Analytic Hessians require calculator support. OrbMol-v2 additionally requires Kun Tang's [`orb-hessian`](https://github.com/Senppoa/orb-hessian) patch and a server started with `--hessian analytic`.
+Use `qmint start --hessian analytic` when the selected calculator provides analytic Hessians. Otherwise, use the default numeric mode.
 
-## Configuration
+## Paths
 
-| Setting | Default |
+| Data | Default path |
 | --- | --- |
-| Configuration | `~/.config/qmint/config.json` (`QMINT_CONFIG_HOME` overrides it) |
-| Model directory | `~/.local/share/qmint/models` (`MLP_MODEL_DIR` takes precedence) |
-| Server state | `/tmp/qmint_<job-id>.json` |
-| Server log | `~/.local/state/qmint/server.log` |
-| Threads | `MLP_THREADS` > `OMP_NUM_THREADS` > `1` |
+| Configuration | `~/.config/qmint/config.json` |
+| Models | `~/.local/share/qmint/models` |
+| Runtime state | `/tmp/qmint_<job-id>.json` |
+| Log | `~/.local/state/qmint/server.log` |
 
-The server listens only on `127.0.0.1`. Do not commit model weights or runtime state files.
+`QMINT_CONFIG_HOME` changes the configuration directory. `MLP_MODEL_DIR` changes the model directory. QMint listens on `127.0.0.1` and protects each local session with a random token.
 
 ## Development
 
@@ -132,38 +138,8 @@ python -m unittest discover -s tests -v
 python -m compileall -q qmint
 ```
 
-The fast test suite covers configuration and model registration, authenticated framing, Gaussian/ORCA file handling, unit conversion, and ASE task execution. Real backend tests require the corresponding weights and environment.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the internal design.
 
-## Repository Layout
+## Citation and license
 
-```text
-qmint/
-  calculator.py       Backend loading, ASE tasks, and Hessians
-  cli.py              QMint CLI and compatibility commands
-  config.py           Persistent user configuration
-  models.py           Built-in and custom model registry
-  protocol.py         Authenticated local socket protocol
-  server.py           The single multi-worker service
-  tui.py              Curses terminal UI
-  interfaces/         Gaussian and ORCA adapters; extension point for VASP
-tests/                Fast regression tests and calculation inputs
-```
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the component boundaries.
-
-## Model Downloads
-
-The first-run TUI offers these public model URLs:
-
-| Model | URL |
-| --- | --- |
-| MACE-OMol extra-large | [mace-foundations release](https://github.com/ACEsuit/mace-foundations/releases/download/mace_omol_0/MACE-omol-0-extra-large-1024.model) |
-| MACE-POLAR-M | [direct download](https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-M.model) |
-| MACE-POLAR-L | [direct download](https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-L.model) |
-| OrbMol-v2 | [Orbital Materials public bucket](https://orbitalmaterials-public-models.s3.us-west-1.amazonaws.com/forcefields/orbmol-v2-teqabfhg-20260523.ckpt) |
-
-UMA checkpoints are access-gated. Follow the [Fairchem UMA documentation](https://github.com/facebookresearch/fairchem) to download them manually, then place the files in the configured model directory.
-
-## License
-
-QMint is released under the [MIT License](LICENSE). Model weights, calculator backends, and optional patches retain their respective third-party licenses.
+Citation metadata is available in [CITATION.cff](CITATION.cff). QMint is released under the [MIT License](LICENSE). Model weights and backend packages keep their own licenses.

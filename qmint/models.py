@@ -31,25 +31,21 @@ BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     "uma-s": {
         "backend": "fairchem",
         "filename": "uma-s-1p1.pt",
-        "aliases": ("s", "small", "uma-s-1p1.pt"),
         "description": "UMA small 1.1",
     },
     "uma-m": {
         "backend": "fairchem",
         "filename": "uma-m-1p1.pt",
-        "aliases": ("m", "medium", "middle", "uma-m-1p1.pt"),
         "description": "UMA medium 1.1",
     },
     "mace": {
         "backend": "mace",
         "filename": "MACE.model",
-        "aliases": (),
         "description": "Generic MACE model",
     },
     "mace-omol": {
         "backend": "mace",
         "filename": "MACE-omol-0-extra-large-1024.model",
-        "aliases": (),
         "description": "MACE OMol extra-large",
         "head": "omol",
         "download_url": (
@@ -61,7 +57,6 @@ BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     "mace-polar-m": {
         "backend": "mace",
         "filename": "MACE-POLAR-1-M.model",
-        "aliases": (),
         "description": "MACE POLAR medium",
         "download_url": (
             "https://github.com/ACEsuit/mace-foundations/releases/download/"
@@ -72,7 +67,6 @@ BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     "mace-polar-l": {
         "backend": "mace",
         "filename": "MACE-POLAR-1-L.model",
-        "aliases": (),
         "description": "MACE POLAR large",
         "download_url": (
             "https://github.com/ACEsuit/mace-foundations/releases/download/"
@@ -83,20 +77,17 @@ BUILTIN_MODELS: dict[str, dict[str, Any]] = {
     "mace-mh-1": {
         "backend": "mace",
         "filename": "mace-mh-1.model",
-        "aliases": (),
         "description": "MACE multi-head model (OMol head)",
         "head": "omol",
     },
     "deepest-os": {
         "backend": "mace",
         "filename": "deepest-os.model",
-        "aliases": (),
         "description": "DeepEst-OS MACE model",
     },
     "orbmol-v2": {
         "backend": "orb",
         "filename": "orbmol-v2-teqabfhg-20260523.ckpt",
-        "aliases": ("orb-mol-v2", "orbmol-v2-teqabfhg-20260523.ckpt"),
         "description": "OrbMol v2",
         "download_url": (
             "https://orbitalmaterials-public-models.s3.us-west-1.amazonaws.com/"
@@ -110,14 +101,6 @@ BUILTIN_MODELS: dict[str, dict[str, Any]] = {
 def model_dir(config: dict[str, Any]) -> Path:
     value = os.environ.get("MLP_MODEL_DIR") or config["model_dir"]
     return Path(value).expanduser().resolve()
-
-
-def aliases() -> dict[str, str]:
-    result: dict[str, str] = {}
-    for name, data in BUILTIN_MODELS.items():
-        result[name] = name
-        result.update({alias: name for alias in data["aliases"]})
-    return result
 
 
 def list_models(config: dict[str, Any]) -> list[ModelSpec]:
@@ -153,16 +136,15 @@ def resolve_model(
     config: dict[str, Any],
     backend: str | None = None,
 ) -> ModelSpec:
-    canonical = aliases().get(reference)
-    if canonical:
-        data = BUILTIN_MODELS[canonical]
+    if reference in BUILTIN_MODELS:
+        data = BUILTIN_MODELS[reference]
         selected_backend = backend or data["backend"]
         if selected_backend != data["backend"]:
             raise ValueError(
                 f"Model {reference!r} uses backend {data['backend']!r}, not {selected_backend!r}"
             )
         return ModelSpec(
-            canonical,
+            reference,
             selected_backend,
             model_dir(config) / data["filename"],
             data["description"],
@@ -247,7 +229,7 @@ def add_custom_model(
     description: str = "",
     head: str | None = None,
 ) -> None:
-    if name in aliases():
+    if name in BUILTIN_MODELS:
         raise ValueError(f"{name!r} is reserved by a built-in model")
     if backend not in BACKENDS:
         raise ValueError(f"Unsupported backend: {backend}")

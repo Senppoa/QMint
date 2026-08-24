@@ -19,13 +19,17 @@ class ConfigAndModelTests(unittest.TestCase):
             self.assertEqual(load_config(path)["active_model"], "uma-m")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
-    def test_builtin_alias_resolves_backend_and_model_dir(self):
+    def test_builtin_model_resolves_backend_and_model_dir(self):
         config = default_config()
         config["model_dir"] = "/tmp/qmint-models"
-        spec = resolve_model("small", config)
+        spec = resolve_model("uma-s", config)
         self.assertEqual(spec.name, "uma-s")
         self.assertEqual(spec.backend, "fairchem")
         self.assertEqual(spec.path, Path("/tmp/qmint-models/uma-s-1p1.pt"))
+
+    def test_removed_model_alias_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown model"):
+            resolve_model("small", default_config())
 
     def test_custom_model_registration(self):
         config = default_config()

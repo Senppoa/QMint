@@ -16,28 +16,26 @@ from .protocol import server_info, stop_server
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="qmint",
-        description="QMint: switch ML potentials from the terminal and serve them to quantum-chemistry programs.",
+        description="QMint: serve machine-learning potentials to quantum-chemistry programs.",
     )
     parser.add_argument("--version", action="version", version=f"QMint {__version__}")
     commands = parser.add_subparsers(dest="command")
 
     start_parser = commands.add_parser("start", help="start the model server")
-    start_parser.add_argument("--model", "-m", help="model alias, registered name, or file path")
+    start_parser.add_argument("--model", "-m", help="model name, registered name, or file path")
     start_parser.add_argument("--backend", "-b", choices=BACKENDS)
-    start_parser.add_argument("--workers", "--np", "-n", type=int)
+    start_parser.add_argument("--workers", "-n", type=int)
     device_group = start_parser.add_mutually_exclusive_group()
     device_group.add_argument("--gpu", "-g", nargs="?", const="auto", metavar="IDS")
     device_group.add_argument("--cpu", action="store_true", help="override configured GPU use")
     start_parser.add_argument("--hessian", choices=("numeric", "analytic"))
     start_parser.add_argument("--debug", "-d", action="store_true")
-    commands.add_parser("stop", aliases=["exit"], help="stop the running model server")
+    commands.add_parser("stop", help="stop the running model server")
     commands.add_parser("status", help="show server and active model status")
     commands.add_parser("models", help="list built-in and registered models")
 
-    use_parser = commands.add_parser(
-        "use", aliases=["switch"], help="select the default model for future starts"
-    )
-    use_parser.add_argument("model", help="model alias or registered model name")
+    use_parser = commands.add_parser("use", help="select the default model for future starts")
+    use_parser.add_argument("model", help="built-in or registered model name")
     use_parser.add_argument("--backend", "-b", choices=BACKENDS)
 
     model_commands = commands.add_parser("model", help="manage custom model registrations")
@@ -121,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "start":
             _start(args, config)
-        elif args.command in ("stop", "exit"):
+        elif args.command == "stop":
             stop_server()
             print("QMint server stopped")
         elif args.command == "status":
@@ -133,7 +131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("QMint server is not running")
         elif args.command == "models":
             _print_models(config)
-        elif args.command in ("use", "switch"):
+        elif args.command == "use":
             spec = resolve_model(args.model, config, args.backend)
             config["active_model"] = spec.name if spec.builtin else args.model
             save_config(config)
@@ -173,13 +171,3 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (RuntimeError, ValueError, OSError) as exc:
         print(f"qmint: error: {exc}", file=sys.stderr)
         return 1
-
-
-def server_main(argv: Sequence[str] | None = None) -> int:
-    """Compatibility entry point for the historical ``server`` command."""
-    values = list(sys.argv[1:] if argv is None else argv)
-    if values and values[0] in ("start", "stop", "exit"):
-        command = "stop" if values[0] == "exit" else values[0]
-        return main([command, *values[1:]])
-    print("Use 'server start ...' or 'server exit'. For model switching use 'qmint use ...'.")
-    return 2
