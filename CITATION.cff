@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use QMint in your research, please cite this software."
-title: "QMint: Quantum Machine-Learning Interface"
+title: "QMint: Quantum Chemistry - Machine Learning Interatomic Potentials Interface"
 type: software
 authors:
   - family-names: Tang
