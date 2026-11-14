@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""ORCA 外部优化器接口：把 ORCA 请求转发给本项目的 MLP 服务。
+
+ORCA 的 ``ExtOpt`` 功能调用本脚本。参数文件给出 XYZ 文件路径、电荷、
+自旋多重度、线程数和是否需要梯度；脚本把服务结果写成 ORCA ``.engrad`` 文件。
+使用前必须先启动 ``server`` 或 ``server-multi``。
+"""
+
+# ORCA 调用形式与输入示例：
+# scriptname basename_EXT.extinp.tmp [args]
+# 对应 ORCA 输入中的：
+# ! ExtOpt
+# %method
+#  ProgExt "/full/path/to/script"
+#  Ext_Params "optional command line arguments"
+# end
+# https://www.faccts.de/docs/orca/6.0/manual/contents/detailed/geomopt.html#orca-as-external-optimizer
+
+import os
+import sys
+import argparse
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from utils import send_task
+
+
+def remove_comment(src: str) -> str:
+    """去掉参数行两端空白以及 ``#`` 后的行内注释。"""
+    return src.strip().split('#')[0].strip()
+
+
+def read_xyz(file):
+    """读取标准 XYZ 文件，返回原子数和原子坐标文本行。"""
+    with open(file) as f:
+       data = f.readlines()
+       num_atoms = int(data[0].strip())
+       coord = data[2:2+num_atoms]
+       if len(coord) != num_atoms:
+           raise ValueError(f'XYZ declares {num_atoms} atoms but contains {len(coord)} coordinate lines')
+    return num_atoms, coord
+
+
+def get_engrad_path(input_path):
+    """按完整后缀生成 ORCA 输出路径，不使用会误删字符的 ``rstrip``。"""
+    suffix = '.extinp.tmp'
+    if input_path.endswith(suffix):
+        return input_path[:-len(suffix)] + '.engrad'
+    return input_path + '.engrad'
+
+
+def main():
+    """读取 ORCA 临时输入、请求计算并生成 ``.engrad`` 输出。"""
+    parser = argparse.ArgumentParser('ORCA/uma calculator server interface')
+    parser.add_argument('file')
+    parser.add_argument('--service', '-s', default=None,
+                        help='把本次任务发送到指定的命名服务实例')
+    args = parser.parse_args()
+
+    # ORCA 临时参数文件的前五行含义固定，允许每行尾部附带 # 注释。
+    with open(args.file) as f:
+        xyz_file = remove_comment(f.readline())
+        charge = int(remove_comment(f.readline()))
+        mult = int(remove_comment(f.readline()))
+        num_threads = int(remove_comment(f.readline()))
+        require_grad_value = int(remove_comment(f.readline()))
+        if require_grad_value not in (0, 1):
+            raise ValueError('ORCA gradient flag must be 0 or 1')
+        require_grad = require_grad_value == 1
+    if num_threads < 1:
+        raise ValueError('The ORCA external interface thread count must be at least 1')
+    if mult < 1:
+        raise ValueError('Spin multiplicity must be at least 1')
+
+    # XYZ 坐标本身已使用 Angstrom，与 ASE 的默认长度单位一致，无需换算。
+    num_atoms, coord = read_xyz(xyz_file)
+
+    # ORCA 此接口只请求能量/梯度，不通过它请求 Hessian。
+    task = {
+        'charge': charge,
+        'mult': mult,
+        'num_threads': num_threads,
+        'coord': coord,
+        'hessian': False
+    }
+
+    result = send_task(task, service=args.service)  # 同步等待服务端 worker 完成本次推理。
+    if 'error' in result:
+        print('Error: ', result['error'])
+        sys.exit(1)
+    
+    energy = result['energy']
+    gradient = result['gradient']
+
+    # ORCA 期待与临时输入同 basename 的 .engrad 文件。
+    output_file_name = get_engrad_path(args.file)
+    with open(output_file_name, mode='w', encoding='utf-8', newline='\n') as f:
+        f.writelines([
+            '# \n',
+            '# Number of atoms\n',
+            '# \n',
+            f'{num_atoms}\n',
+            '# \n',
+            '# The current total energy in Eh\n',
+            '# \n',
+            f'{energy:.12f}\n'
+        ])
+        if require_grad:
+            # ORCA 要求梯度按 Atom1X, Atom1Y, Atom1Z, Atom2X... 每行一个数。
+            f.writelines([
+            '# \n',
+            '# The current gradient in Eh/bohr: Atom1X, Atom1Y, Atom1Z, Atom2X, etc.\n',
+            '# \n'
+            ])
+            for g in gradient.flatten():
+                f.write(f'{g:.12f}\n')
+    
+    # 同时以 ORCA 6 的单点能格式输出到 stdout，便于合并日志和现有解析器读取。
+    print('\n-------------------------   --------------------')
+    print(f'FINAL SINGLE POINT ENERGY   {energy:>20.12f}')
+    print('-------------------------   --------------------\n')
+
+
+if __name__ == '__main__':
+    main()

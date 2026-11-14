@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""并行管理位于不同 Python 虚拟环境中的命名 MLP 服务。"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from utils import get_port_file, get_service_record, probe_service
+
+
+def load_config(path):
+    """读取并校验服务配置，返回 ``(配置路径, 服务字典)``。"""
+    config_path = Path(path).expanduser().resolve()
+    with config_path.open(encoding='utf-8') as stream:
+        config = json.load(stream)
+    services = config.get('services')
+    if not isinstance(services, dict) or not services:
+        raise ValueError('Configuration must contain a non-empty "services" object')
+    for name, spec in services.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError('Every service must have a non-empty string name')
+        if not isinstance(spec, dict):
+            raise ValueError(f'Service {name!r} must be an object')
+        args = spec.get('args', [])
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            raise ValueError(f'Service {name!r} args must be a list of strings')
+        if any(arg == '--service' or arg.startswith('--service=') for arg in args):
+            raise ValueError(f'Service {name!r} must not repeat --service in args')
+    return config_path, services
+
+
+def resolve_python(value, base_dir):
+    """把虚拟环境目录或 Python 可执行文件解析为绝对路径。"""
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = base_dir / candidate
+    if candidate.is_dir():
+        unix_python = candidate / 'bin' / 'python'
+        windows_python = candidate / 'Scripts' / 'python.exe'
+        candidate = windows_python if windows_python.exists() else unix_python
+    candidate = candidate.resolve()
+    if not candidate.is_file():
+        raise ValueError(f'Python interpreter does not exist: {candidate}')
+    return candidate
+
+
+def build_command(name, spec, action, config_dir):
+    """构造一个服务的启动/退出命令、工作目录和环境变量。"""
+    python = resolve_python(spec.get('python', sys.executable), config_dir)
+    server_value = spec.get('server', 'server')
+    server = Path(server_value).expanduser()
+    if not server.is_absolute():
+        config_relative = config_dir / server
+        project_relative = Path(__file__).resolve().parent / server
+        server = config_relative if config_relative.exists() else project_relative
+    server = server.resolve()
+    if not server.is_file():
+        raise ValueError(f'Server script does not exist for {name!r}: {server}')
+
+    cwd_value = spec.get('cwd', str(config_dir))
+    cwd = Path(cwd_value).expanduser()
+    if not cwd.is_absolute():
+        cwd = config_dir / cwd
+    cwd = cwd.resolve()
+    if not cwd.is_dir():
+        raise ValueError(f'Working directory does not exist for {name!r}: {cwd}')
+
+    env = os.environ.copy()
+    extra_env = spec.get('env', {})
+    if not isinstance(extra_env, dict):
+        raise ValueError(f'Service {name!r} env must be an object')
+    env.update({str(key): str(value) for key, value in extra_env.items()})
+    env['MLP_SERVICE'] = name
+
+    command = [str(python), str(server), action, '--service', name]
+    if action == 'start':
+        command.extend(spec.get('args', []))
+    return command, str(cwd), env
+
+
+def run_service_command(name, spec, action, config_dir):
+    command, cwd, env = build_command(name, spec, action, config_dir)
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return name, completed
+
+
+def select_services(services, requested):
+    if not requested:
+        return services
+    missing = [name for name in requested if name not in services]
+    if missing:
+        raise ValueError(f'Unknown service(s): {", ".join(missing)}')
+    return {name: services[name] for name in requested}
+
+
+def run_parallel(services, action, config_dir):
+    """并行调用各虚拟环境中的 server 脚本。"""
+    if not services:
+        return []
+    failures = []
+    with ThreadPoolExecutor(max_workers=len(services)) as executor:
+        futures = {
+            executor.submit(run_service_command, name, spec, action, config_dir): name
+            for name, spec in services.items()
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                _, completed = future.result()
+            except Exception as exc:
+                failures.append((name, str(exc)))
+                continue
+            if completed.returncode:
+                detail = (completed.stderr or completed.stdout).strip()
+                failures.append((name, detail or f'exit code {completed.returncode}'))
+    return failures
+
+
+def wait_for_states(names, expected_running, timeout):
+    """等待全部服务达到运行或停止状态。"""
+    pending = set(names)
+    deadline = time.monotonic() + timeout
+    while pending and time.monotonic() < deadline:
+        for name in list(pending):
+            if probe_service(name, timeout=0.5) == expected_running:
+                pending.remove(name)
+        if pending:
+            time.sleep(0.25)
+    return pending
+
+
+def print_status(services):
+    failed = False
+    for name in services:
+        running = probe_service(name, timeout=0.5)
+        if running:
+            record = get_service_record(name)
+            print(
+                f'{name}: RUNNING pid={record.get("pid")} port={record.get("port")} '
+                f'backend={record.get("backend", "?")} python={record.get("python", "?")}'
+            )
+        else:
+            failed = True
+            print(f'{name}: STOPPED discovery={get_port_file(name)}')
+    return 1 if failed else 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='并行启动、停止和检查多个虚拟环境中的 MLP 服务'
+    )
+    parser.add_argument('action', choices=['start', 'stop', 'status'])
+    parser.add_argument('names', nargs='*', help='仅操作列出的服务；默认操作全部服务')
+    parser.add_argument('-c', '--config', default='mlp-services.json')
+    parser.add_argument('--timeout', type=float, default=300.0)
+    args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error('--timeout must be greater than zero')
+
+    try:
+        config_path, all_services = load_config(args.config)
+        services = select_services(all_services, args.names)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        parser.error(str(exc))
+
+    if args.action == 'status':
+        raise SystemExit(print_status(services))
+
+    command_services = services
+    if args.action == 'stop':
+        # stop 是幂等操作：已停止的服务无需调用其虚拟环境解释器。
+        command_services = {
+            name: spec for name, spec in services.items()
+            if probe_service(name, timeout=0.5)
+        }
+    failures = run_parallel(command_services, args.action, config_path.parent)
+    expected_running = args.action == 'start'
+    pending = wait_for_states(command_services, expected_running, args.timeout)
+    for name in sorted(pending):
+        failures.append((name, f'timed out waiting for service to {args.action}'))
+
+    if failures:
+        for name, detail in failures:
+            print(f'{name}: FAILED: {detail}', file=sys.stderr)
+        raise SystemExit(1)
+
+    print_status(services)
+
+
+if __name__ == '__main__':
+    main()

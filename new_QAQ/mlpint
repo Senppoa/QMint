@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Gaussian External 接口：把 Gaussian 的计算请求转发给 MLP 服务。
+
+Gaussian 通过 ``External`` 机制调用本脚本，并传入输入、输出、消息等文件路径。
+本脚本完成坐标单位转换，构造服务端任务，然后按 Gaussian 规定的文本布局写回
+能量、梯度和（可选）Hessian。使用前必须先启动 ``server`` 或 ``server-multi``。
+"""
+
+import os
+import sys
+from utils import send_task
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# 用户可用该环境变量控制单次推理使用的 CPU 线程数。
+MLP_THREADS = 'MLP_THREADS'
+
+# 1 Bohr = 0.529177249 Angstrom；Gaussian 输入坐标使用 Bohr，ASE 使用 Angstrom。
+BOHR2AU = 0.529177249
+
+
+def read_service_arg(argv):
+    """从 Gaussian 固定尾参数之前读取可选的 ``--service``。"""
+    prefix = argv[1:-5]
+    for index, value in enumerate(prefix):
+        if value.startswith('--service='):
+            return value.split('=', 1)[1]
+        if value in ('--service', '-s'):
+            if index + 1 >= len(prefix):
+                raise ValueError(f'{value} requires a service name')
+            return prefix[index + 1]
+    return None
+
+
+def main():
+    """解析一次 Gaussian External 调用并把结果写回 Gaussian。"""
+
+    # Gaussian 的固定尾参数布局：layer InputFile OutputFile MsgFile FChkFile MatElFile。
+    # 前面允许出现脚本自定义参数，所以从 argv 尾部倒数定位，而不是使用固定正索引。
+    args = sys.argv
+    if len(args) < 7:
+        raise SystemExit(
+            'Usage: mlpint [--service NAME] layer InputFile OutputFile MsgFile '
+            'FChkFile MatElFile'
+        )
+    service = read_service_arg(args)
+    input_file = args[-5]
+    # input_dir = os.path.dirname(os.path.abspath(args[-5]))  # input file directory (Gaussian scratch)
+    output_file = args[-4]  # Output file read by Gaussian
+    log_file = args[-3]  # Error messages are written.
+    # additional_args = args[1:-5]
+
+    # 第一行是任务元数据，随后 num_atoms 行是“原子序数 X Y Z”。
+    with open(input_file, 'r') as f:
+        input_data = f.readlines()
+
+    # 字段依次为：原子数、导数阶数、总电荷、自旋多重度。
+    num_atoms, derivatives_type, charge, mult = [int(x) for x in input_data[0].strip().split()]
+    if num_atoms < 1:
+        raise ValueError('Gaussian input must contain at least one atom')
+    if derivatives_type not in (0, 1, 2):
+        raise ValueError(f'Unsupported Gaussian derivative order: {derivatives_type}')
+    if mult < 1:
+        raise ValueError('Spin multiplicity must be at least 1')
+    if len(input_data) < num_atoms + 1:
+        raise ValueError(f'Input declares {num_atoms} atoms but contains fewer coordinate lines')
+    # 服务端接受“元素/原子序数 X Y Z”的字符串列表，坐标单位必须是 Angstrom。
+    coord = []
+    for line in input_data[1:num_atoms+1]:
+        parts = line.strip().split()
+        coord.append(f'{parts[0]} {float(parts[1])*BOHR2AU:20.12f} {float(parts[2])*BOHR2AU:20.12f} {float(parts[3])*BOHR2AU:20.12f}\n')
+
+    # MLP_THREADS 优先于通用的 OMP_NUM_THREADS；两者都未设置时保守使用单线程。
+    num_threads = None
+    for name in [MLP_THREADS, 'OMP_NUM_THREADS']:
+        value = os.environ.get(name)
+        if value is not None:
+            if len(value.strip()) > 0:
+                num_threads = int(value.strip())
+                break
+    if num_threads is None:
+        num_threads = 1
+    if num_threads < 1:
+        raise ValueError('MLP_THREADS/OMP_NUM_THREADS must be at least 1')
+
+    # 二阶导数请求用 hessian=True 表示；一阶及零阶任务不计算 Hessian。
+    task = {
+        'charge': charge,
+        'mult': mult,
+        'num_threads': num_threads,
+        'coord': coord,
+        'hessian': derivatives_type == 2
+    }
+
+    # send_task 是同步调用：直到某个 worker 返回结果后才继续写输出文件。
+    result = send_task(task, service=service)
+
+    # 服务端统一用 {'error': '...'} 返回可恢复异常，并写入 Gaussian 的消息文件。
+    if 'error' in result:
+        with open(log_file, 'w') as f:
+            f.write('---------------------Error in ASE calculator---------------------\n')
+            f.write(result['error'])
+        raise SystemExit(1)
+
+    # 正常结果已经统一为原子单位：Eh、Eh/Bohr、Eh/Bohr^2。
+    else:
+        # Prepare output file for Gaussian
+        output_data = []
+
+        # Gaussian 第一条记录：能量 + 偶极矩三个分量；模型不提供偶极矩，故填零。
+        output_data.append('{0:20.12e}{1:20.12e}{2:20.12e}{3:20.12e}\n'.format(result['energy'], 0.0, 0.0, 0.0))
+
+        # 一阶及以上请求：逐原子写出 x/y/z 梯度，每行 3 个 D20.12 风格浮点数。
+        if derivatives_type >= 1:
+            gradient = result['gradient']
+            for n in range(num_atoms):
+                output_data.append('{0:20.12e}{1:20.12e}{2:20.12e}\n'.format(gradient[n][0], gradient[n][1], gradient[n][2]))
+
+        # 接口还要求极化率（6 个数）和偶极矩导数（9N 个数）。模型不提供这些量，
+        # 这里写入 3N+2 行、每行三个零，正好占满 9N+6 个字段。
+        for n in range(3 * num_atoms + 2):
+            output_data.append('{0:20.12e}{1:20.12e}{2:20.12e}\n'.format(0.0, 0.0, 0.0))
+
+        # 二阶请求：Gaussian 只接收 Hessian 下三角，按行展开后每三个数写一行。
+        if derivatives_type == 2:
+            hessian = result['hessian']
+            # 从服务端的 (3N, 3N) 矩阵抽取 i >= j 的元素。
+            gaussian_hessian = []
+            temp = []
+            for i in range(num_atoms*3):
+                for j in range(i+1):
+                    temp.append(hessian[i][j])
+                    if len(temp) == 3:
+                        gaussian_hessian.append(temp)
+                        temp = []
+            for line in gaussian_hessian:
+                output_data.append('{0:20.12e}{1:20.12e}{2:20.12e}\n'.format(line[0], line[1], line[2]))
+
+        # .EOu 供 Gaussian 读取；清空消息文件表示接口没有额外错误信息。
+        with open(output_file, 'w') as f: # (.EOu)
+            f.writelines(output_data)
+        with open(log_file, 'w') as f: # (.log)
+            f.write('')
+
+
+if __name__ == '__main__':
+    main()
