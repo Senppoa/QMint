@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+GMINT_MODEL_DIR=""  # Optional override, e.g. /home/asus/model_pt; empty = use MLP_MODEL_DIR or -m.
+set -Eeuo pipefail
+
+# Run independent Gaussian jobs concurrently, one persistent model service per GPU.
+
+SCRIPT_PATH=${BASH_SOURCE[0]}
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR=$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)
+    SCRIPT_PATH=$(readlink "$SCRIPT_PATH")
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+PROJECT_DIR=$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)
+
+SERVER="$PROJECT_DIR/server-multi"
+CLIENT="$PROJECT_DIR/mlpint"
+
+usage()
+{
+    cat <<'EOF'
+Usage:
+  gmint-g16 --backend BACKEND [options] INPUT.gjf [MORE_INPUTS...]
+  gmint-g16 --backend BACKEND [options] --all
+
+Required:
+  -b, --backend NAME       fairchem (UMA), mace, or orb
+
+Options:
+  -m, --model MODEL        Model alias or absolute model path
+  -g, --gpu GPUS           GPU selection, for example 0, 1, 0,1, or auto
+      --cpu                Use CPU only (default when --gpu is omitted)
+  -n, --workers N          Max simultaneous Gaussian files (default: one per GPU)
+  -s, --service NAME       Service name (default: uma/mace/orb by backend)
+  -j, --job-id ID          Routing job ID (default: unique ID generated per run)
+  -o, --output FILE        Gaussian log path; valid only with one input
+      --all                Run every .gjf/.com file in the current directory
+                           Multiple GPUs run different files simultaneously
+  -t, --threads N          Threads used by one inference request
+      --hessian MODE       numeric or analytic (default: numeric)
+      --startup-timeout S  Seconds to wait for model loading (default: 300)
+      --keep-server        Do not stop the service after Gaussian finishes
+  -h, --help               Show this help
+
+Examples:
+  conda activate fairchem
+  ./gmint-g16 -b fairchem -m s -g 0 molecule.gjf
+
+  conda activate mace
+  ./gmint-g16 -b mace -m mace-omol -g 1 molecule.gjf
+
+  # One UMA service per GPU; a free GPU immediately takes the next input.
+  ./gmint-g16 -b fairchem -m /data/models/uma.pt -g 0,1 --all
+
+  # Use every visible GPU (including scheduler-assigned CUDA devices).
+  ./gmint-g16 -b fairchem -m /data/models/uma.pt -g auto --all
+
+The Gaussian input must use External="mlpint", or point External to the
+mlpint file located beside this script.
+
+Model location:
+  Set GMINT_MODEL_DIR near the top of this script, export MLP_MODEL_DIR before
+  running it, or pass an absolute model file path to --model/-m.
+EOF
+}
+
+die()
+{
+    echo "gmint-g16: $*" >&2
+    exit 1
+}
+
+require_value()
+{
+    [[ $# -ge 2 && -n "${2:-}" ]] || die "$1 requires a value"
+}
+
+backend=""
+model=""
+gpu=""
+workers=""
+service=""
+job_id=""
+output=""
+threads="${MLP_THREADS:-${OMP_NUM_THREADS:-1}}"
+hessian="numeric"
+startup_timeout=300
+keep_server=0
+all_current=0
+inputs=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--backend)
+            require_value "$@"
+            backend=$2
+            shift 2
+            ;;
+        -m|--model)
+            require_value "$@"
+            model=$2
+            shift 2
+            ;;
+        -g|--gpu)
+            require_value "$@"
+            gpu=$2
+            shift 2
+            ;;
+        --cpu)
+            gpu=""
+            shift
+            ;;
+        -n|--workers)
+            require_value "$@"
+            workers=$2
+            shift 2
+            ;;
+        -s|--service)
+            require_value "$@"
+            service=$2
+            shift 2
+            ;;
+        -j|--job-id)
+            require_value "$@"
+            job_id=$2
+            shift 2
+            ;;
+        -o|--output)
+            require_value "$@"
+            output=$2
+            shift 2
+            ;;
+        --all)
+            all_current=1
+            shift
+            ;;
+        -t|--threads)
+            require_value "$@"
+            threads=$2
+            shift 2
+            ;;
+        --hessian)
+            require_value "$@"
+            hessian=$2
+            shift 2
+            ;;
+        --startup-timeout)
+            require_value "$@"
+            startup_timeout=$2
+            shift 2
+            ;;
+        --keep-server)
+            keep_server=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            while [[ $# -gt 0 ]]; do
+                inputs+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            die "unknown option: $1"
+            ;;
+        *)
+            inputs+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$backend" ]] || die "--backend is required"
+
+if [[ $all_current -eq 1 ]]; then
+    [[ ${#inputs[@]} -eq 0 ]] || die "--all cannot be combined with explicit input files"
+    mapfile -d '' -t inputs < <(
+        find "$PWD" -maxdepth 1 -type f \
+            \( -iname '*.gjf' -o -iname '*.com' \) -print0 | sort -zV
+    )
+fi
+
+[[ ${#inputs[@]} -gt 0 ]] || die "no Gaussian .gjf/.com input files were found"
+if [[ -n "$output" && ${#inputs[@]} -ne 1 ]]; then
+    die "--output can be used only when exactly one input file is selected"
+fi
+
+case "$backend" in
+    fairchem)
+        service=${service:-uma}
+        model=${model:-s}
+        ;;
+    mace)
+        service=${service:-mace}
+        model=${model:-mace-omol}
+        ;;
+    orb)
+        service=${service:-orb}
+        model=${model:-orbmol-v2}
+        ;;
+    *)
+        die "unsupported backend '$backend' (use fairchem, mace, or orb)"
+        ;;
+esac
+
+[[ "$service" =~ ^[A-Za-z0-9._-]+$ ]] || die "service may contain only letters, numbers, dot, underscore, and hyphen"
+[[ -z "$workers" || "$workers" =~ ^[1-9][0-9]*$ ]] || die "workers must be a positive integer"
+[[ "$threads" =~ ^[1-9][0-9]*$ ]] || die "threads must be a positive integer"
+[[ "$startup_timeout" =~ ^[1-9][0-9]*$ ]] || die "startup timeout must be a positive integer"
+[[ "$hessian" == "numeric" || "$hessian" == "analytic" ]] || die "hessian must be numeric or analytic"
+
+if [[ -z "$job_id" ]]; then
+    job_id="gmint-${service}-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+[[ "$job_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "job ID may contain only letters, numbers, dot, underscore, and hyphen"
+
+resolved_inputs=()
+for input in "${inputs[@]}"; do
+    [[ -f "$input" ]] || die "Gaussian input does not exist: $input"
+    resolved_inputs+=("$(realpath "$input")")
+done
+inputs=("${resolved_inputs[@]}")
+
+if [[ -n "$output" ]]; then
+    output=$(realpath -m "$output")
+fi
+
+[[ -x "$SERVER" ]] || die "$SERVER is not executable; run: chmod +x '$SERVER'"
+[[ -x "$CLIENT" ]] || die "$CLIENT is not executable; run: chmod +x '$CLIENT'"
+[[ -f "$PROJECT_DIR/gmint_batch.py" ]] || die "gmint_batch.py is missing; copy the complete updated project"
+command -v python3 >/dev/null 2>&1 || die "python3 is not available in the active environment"
+command -v g16 >/dev/null 2>&1 || die "g16 is not available; load the Gaussian environment first"
+
+# Put this project before Conda's old entry points. Gaussian inherits PATH and
+# therefore resolves External="mlpint" to the client beside this script.
+export PATH="$PROJECT_DIR:$PATH"
+hash -r
+if [[ -n "$GMINT_MODEL_DIR" ]]; then
+    export MLP_MODEL_DIR="$GMINT_MODEL_DIR"
+fi
+export MLP_JOBID="$job_id"
+export MLP_SERVICE="$service"
+export MLP_THREADS="$threads"
+
+for input in "${inputs[@]}"; do
+    if ! grep -iq 'external' "$input"; then
+        echo "gmint-g16: warning: no Gaussian External keyword was detected in $input" >&2
+    fi
+done
+
+batch_command=(
+    python3 "$PROJECT_DIR/gmint_batch.py"
+    --backend "$backend"
+    --model "$model"
+    --service "$service"
+    --job-id "$job_id"
+    --hessian "$hessian"
+    --startup-timeout "$startup_timeout"
+)
+if [[ -n "$gpu" ]]; then
+    batch_command+=(--gpu "$gpu")
+fi
+if [[ -n "$workers" ]]; then
+    batch_command+=(--workers "$workers")
+fi
+if [[ -n "$output" ]]; then
+    batch_command+=(--output "$output")
+fi
+if [[ $keep_server -eq 1 ]]; then
+    batch_command+=(--keep-server)
+fi
+
+echo "[gmint] Server:    $SERVER"
+echo "[gmint] Client:    $(command -v mlpint)"
+echo "[gmint] Model dir: ${MLP_MODEL_DIR:-<server directory; absolute -m paths take precedence>}"
+batch_command+=(-- "${inputs[@]}")
+exec "${batch_command[@]}"

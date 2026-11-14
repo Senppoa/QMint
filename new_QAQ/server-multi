@@ -1,0 +1,755 @@
+#!/usr/bin/env python3
+"""多 GPU 模型推理服务：把常驻 worker 分配到指定 GPU 或 CPU。
+
+它与 ``server`` 使用相同的客户端协议、任务格式和端口文件；主要差异是 ``-g``
+可以接收 GPU 列表（例如 ``-g 0,2``），每张 GPU 分配一个 worker，多出的 worker
+回落到 CPU。GPU worker 空闲时，CPU worker 会暂时让路，优先使用更快的 GPU。
+"""
+
+import sys
+import socket
+import multiprocessing
+import os
+import time
+import argparse
+import shutil
+import warnings
+import traceback
+import signal
+import select
+import tempfile
+from pathlib import Path
+from multiprocessing import Queue
+from queue import Empty
+warnings.simplefilter('ignore')
+
+np = None
+torch = None
+Atoms = None
+Vibrations = None
+Hartree = None
+Bohr = None
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from utils import (recv_pickle, send_pickle, get_port_number, save_port_file,
+                   remove_port_file, daemonize, get_server_pid,
+                   wait_for_server_down, force_kill_server, wait_for_pid_gone,
+                   read_int_list_string, get_service_name,
+                   prepare_service_start, get_service_log_file, cuda_device_token)
+
+
+# 模型短名称映射；未命中的值按用户提供的文件路径处理。
+MODEL_FILE = {
+    # Names for small version 1p1
+    's': 'uma-s-1p1.pt',
+    'small': 'uma-s-1p1.pt',
+    'uma-s-1p1.pt': 'uma-s-1p1.pt',
+    # Names for medium version 1p1
+    'm': 'uma-m-1p1.pt',
+    'medium': 'uma-m-1p1.pt',
+    'middle': 'uma-m-1p1.pt',
+    'uma-m-1p1.pt': 'uma-m-1p1.pt',
+    # Names for MACE model
+    'mace': 'MACE.model',
+    'mace-omol': 'MACE-omol-0-extra-large-1024.model',
+    'mace-polar-m': 'MACE-POLAR-1-M.model',
+    'mace-polar-l': 'MACE-POLAR-1-L.model',
+    'mace-mh-1': 'mace-mh-1.model',
+    # Names for OrbMol-v2 model (orb-models >= 0.7, main-branch 'orbmol_v2' loader)
+    'orbmol-v2': 'orbmol-v2-teqabfhg-20260523.ckpt',
+    'orb-mol-v2': 'orbmol-v2-teqabfhg-20260523.ckpt',
+    'orbmol-v2-teqabfhg-20260523.ckpt': 'orbmol-v2-teqabfhg-20260523.ckpt',
+}
+
+MODEL_NAMES = MODEL_FILE.keys()
+
+
+def load_runtime_dependencies():
+    """仅在启动/计算时加载 NumPy、PyTorch 和 ASE。"""
+    global np, torch, Atoms, Vibrations, Hartree, Bohr
+    if Atoms is not None:
+        return
+    import numpy as numpy_module
+    import torch as torch_module
+    from ase import Atoms as atoms_class
+    from ase.vibrations import Vibrations as vibrations_class
+    from ase.units import Hartree as hartree_unit, Bohr as bohr_unit
+    np = numpy_module
+    torch = torch_module
+    Atoms = atoms_class
+    Vibrations = vibrations_class
+    Hartree = hartree_unit
+    Bohr = bohr_unit
+
+
+def resolve_model_path(model):
+    """解析模型别名；相对路径以 MLP_MODEL_DIR 或脚本目录为根。"""
+    if model in MODEL_FILE:
+        model_file = MODEL_FILE[model]
+    else:
+        model_file = model
+    if os.path.isabs(model_file):
+        return model_file
+    model_dir = os.environ.get('MLP_MODEL_DIR', str(Path(__file__).absolute().parent))
+    return str(Path(model_dir) / model_file)
+
+
+def prepare_wsl_libcuda_env():
+    """在创建 worker 前修正 WSL2 上 NVIDIA Warp 的 CUDA 驱动搜索路径。
+
+    Orb 后端的默认建边实现会加载 libcuda；把 WSL 驱动目录置顶可避免误加载
+    旧 stub。非 WSL 环境没有该文件时直接返回。
+    """
+    wsl_lib = '/usr/lib/wsl/lib'
+    if not os.path.exists(os.path.join(wsl_lib, 'libcuda.so.1')):
+        return
+    current = os.environ.get('LD_LIBRARY_PATH', '')
+    parts = [p for p in current.split(os.pathsep) if p and p != wsl_lib]
+    parts.insert(0, wsl_lib)
+    os.environ['LD_LIBRARY_PATH'] = os.pathsep.join(parts)
+
+
+def load_calculator(model, backend, device, hessian_mode='numeric'):
+    """按后端加载模型，返回 ``(ASE计算器, 权重路径, 实际加载设备)``。
+
+    将三个后端的不同构造方式封装在这里，使 worker 后续只依赖统一的 ASE
+    Calculator 接口。``load_device`` 单独返回是为了记录设备重映射后的真实参数。
+    """
+    load_runtime_dependencies()
+    model_path = resolve_model_path(model)
+
+    if backend == 'fairchem':
+        # FAIRChem 不接受 cuda:N，只识别 CUDA_VISIBLE_DEVICES + 普通的 cuda。
+        # 因此在每个独立 worker 内重映射可见设备，不会干扰其他 worker。
+        if device.startswith('cuda:'):
+            os.environ['CUDA_VISIBLE_DEVICES'] = cuda_device_token(device.split(':', 1)[1])
+            backend_device = 'cuda'
+        else:
+            backend_device = device
+
+        try:
+            torch.serialization.add_safe_globals([slice])
+            from fairchem.core import FAIRChemCalculator
+            from fairchem.core.units.mlip_unit import load_predict_unit
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError('fairchem backend is not available in the current environment') from exc
+
+        uma_predictor = load_predict_unit(path=model_path, device=backend_device)
+        calculator = FAIRChemCalculator(uma_predictor, task_name='omol')
+        return calculator, model_path, backend_device
+
+    if backend == 'mace':
+        try:
+            from mace.calculators import MACECalculator
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError('mace backend is not available in the current environment') from exc
+
+        if 'mace-mh-1' in model_path:
+            calculator = MACECalculator(model_paths=model_path, device=device, head='omol')
+        else:
+            calculator = MACECalculator(model_paths=model_path, device=device)
+        return calculator, model_path, device
+
+    if backend == 'orb':
+        try:
+            from orb_models.forcefield import pretrained
+            from orb_models.forcefield.inference.calculator import ORBCalculator
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError('orb backend is not available in the current environment') from exc
+
+        basename = os.path.basename(model_path).lower()
+        if 'orbmol-v2' in basename or 'orbmol_v2' in basename:
+            loader = pretrained.orbmol_v2
+        else:
+            raise ValueError(f'Unsupported orb model weights: {model_path}. Only OrbMol-v2 supported.')
+
+        # 解析 Hessian 需要 orb-hessian 提供 get_hessian，并使用 float64 降低二阶误差。
+        if hessian_mode == 'analytic':
+            try:
+                import orb_hessian  # noqa: F401  (attaches get_hessian to ORBCalculator)
+            except ImportError:
+                raise ImportError(
+                    "Analytic Hessian for the orb backend requires the 'orb-hessian' "
+                    "package: pip install orb-hessian"
+                )
+            precision = 'float64'
+        else:
+            precision = 'float32-high'
+
+        # Orb 与 MACE 都能直接接受 cuda:N，无需修改 CUDA_VISIBLE_DEVICES。
+        orbff, atoms_adapter = loader(
+            weights_path=model_path, device=device, compile=False, precision=precision
+        )
+        calculator = ORBCalculator(orbff, atoms_adapter=atoms_adapter, device=device)
+        return calculator, model_path, device
+
+    raise ValueError(f'Unsupported backend for model {model}')
+
+
+def build_device_list(num_workers, gpu_spec):
+    """根据命令行 GPU 规格生成逐 worker 的设备列表。
+
+    ``None`` 表示未写 -g，全部使用 CPU；``auto``/空串表示自动检测所有可见 GPU；
+    ``0,2-3`` 等显式字符串由 read_int_list_string 展开。每张 GPU 最多分配列表中
+    的一个 worker，worker 数量超过 GPU 数量时，其余 worker 使用 CPU。
+    """
+    load_runtime_dependencies()
+    if not gpu_spec:
+        return ['cpu' for _ in range(num_workers)]
+
+    if gpu_spec == 'auto' or gpu_spec == '':
+        gpu_ids = list(range(torch.cuda.device_count()))
+    else:
+        gpu_ids = read_int_list_string(gpu_spec)
+
+    n_gpus = torch.cuda.device_count()
+    if n_gpus == 0:
+        raise ValueError('未检测到可用 GPU，但请求了 GPU 推理 (-g)。可设置 CUDA_VISIBLE_DEVICES 后重试。')
+    for g in gpu_ids:
+        if g < 0 or g >= n_gpus:
+            raise ValueError(f'GPU {g} 不存在；本机检测到 {n_gpus} 块 GPU (编号 0..{n_gpus - 1})。'
+                             f'也可用 CUDA_VISIBLE_DEVICES 限制可见 GPU。')
+
+    device_list = []
+    for i in range(num_workers):
+        if gpu_ids and i < len(gpu_ids):
+            device_list.append(f'cuda:{gpu_ids[i]}')
+        else:
+            device_list.append('cpu')
+    return device_list
+
+
+def should_wait_for_gpu(device, num_gpu_workers, gpu_busy_count):
+    """GPU 尚有空闲 worker 时让 CPU worker 等待，避免较慢的 CPU 抢走请求。"""
+    return device == 'cpu' and num_gpu_workers > 0 and gpu_busy_count < num_gpu_workers
+
+
+def describe_worker_exitcode(exitcode):
+    """把 worker 退出码转换为可读诊断信息，并提示 SIGKILL 可能来自 OOM。"""
+    if exitcode is None:
+        return 'still running'
+    if exitcode < 0:
+        signal_number = -exitcode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f'SIGNAL_{signal_number}'
+        message = f'killed by signal {signal_number} ({signal_name})'
+        if signal_number == signal.SIGKILL:
+            message += '; possible OOM kill'
+        return message
+    return f'exited with code {exitcode}'
+
+
+def close_ready_queue(ready_queue):
+    """尽力关闭启动握手队列，防止退出时队列后台线程阻塞。"""
+    if ready_queue is None:
+        return
+    try:
+        ready_queue.close()
+    except Exception:
+        pass
+    try:
+        ready_queue.cancel_join_thread()
+    except Exception:
+        pass
+
+
+def abort_startup(processes, server_socket, ready_queue, exit_event, service=None,
+                  exit_code=1):
+    """启动失败时回收 worker、队列、socket 和端口文件，然后结束守护进程。"""
+    exit_event.set()
+
+    # 分阶段 terminate/join/kill，兼顾正常清理和 CUDA 初始化卡死的情况。
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+
+    for p in processes:
+        p.join(timeout=5)
+
+    for p in processes:
+        if p.is_alive():
+            print(f'Worker did not exit after terminate: pid={p.pid}; killing it', file=sys.stderr, flush=True)
+            p.kill()
+
+    for p in processes:
+        p.join(timeout=1)
+
+    close_ready_queue(ready_queue)
+
+    try:
+        server_socket.close()
+    except Exception:
+        pass
+
+    remove_port_file(service)
+    sys.stderr.flush()
+    # Run multiprocessing finalizers so named semaphores are also released.
+    raise SystemExit(exit_code)
+
+
+def process_task(task, calculator, hessian_mode):
+    """执行一个计算任务，返回原子单位的能量、梯度和可选 Hessian。
+
+    输入坐标是 Angstrom。ASE 的 eV、eV/Angstrom 和 eV/Angstrom² 会分别换算为
+    Eh、Eh/Bohr 和 Eh/Bohr²；所有异常被转换为可序列化的 error 字典。
+    """
+    try:
+        load_runtime_dependencies()
+        if not isinstance(task, dict):
+            raise TypeError('Task must be a dictionary')
+        coord = task.get('coord')
+        if not isinstance(coord, (list, tuple)) or not coord:
+            raise ValueError('Task coord must be a non-empty list of coordinate lines')
+        num_threads = int(task.get('num_threads', 1))
+        if num_threads < 1:
+            raise ValueError('Task num_threads must be at least 1')
+        # 限制 PyTorch、OpenMP 和 MKL 线程数，防止多 worker 过度占用 CPU。
+        torch.set_num_threads(num_threads)
+        os.environ['OMP_NUM_THREADS'] = str(num_threads)
+        os.environ['MKL_NUM_THREADS'] = str(num_threads)
+
+        # 坐标首列支持元素符号（C）或原子序数（6）两种格式。
+        try:
+            int(task['coord'][0].split()[0].strip())
+        except (TypeError, ValueError):
+            symbol = True
+        else:
+            symbol = False
+
+        # 元素符号形式。
+        if symbol:
+            symbols = []
+            positions = []
+            for line in task['coord']:
+                if line.strip() == '':
+                    continue
+                parts = line.split()
+                if len(parts) < 4:
+                    raise ValueError(f'Invalid coordinate line: {line!r}')
+                symbols.append(parts[0])
+                positions.append([float(x) for x in parts[1:4]])
+            atoms = Atoms(symbols=symbols, positions=positions)
+
+        # 原子序数形式。
+        else:
+            numbers = []
+            positions = []
+            for line in task['coord']:
+                if line.strip() == '':
+                    continue
+                parts = line.split()
+                if len(parts) < 4:
+                    raise ValueError(f'Invalid coordinate line: {line!r}')
+                numbers.append(int(parts[0]))
+                positions.append([float(x) for x in parts[1:4]])
+            atoms = Atoms(numbers=numbers, positions=positions)
+
+        # OrbMol 等分子模型需要从 atoms.info 取得电荷和自旋多重度。
+        atoms.info = {'charge': task['charge'], 'spin': task['mult']}
+        atoms.set_calculator(calculator)
+
+        # ASE 返回“势能”和“力”；量化化学接口需要能量和梯度，所以梯度取力的负值。
+        energy = atoms.get_potential_energy() / Hartree
+        gradient = -1.0 * atoms.get_forces() / (Hartree / Bohr)
+
+        # Hessian 代价远高于能量/梯度，只有客户端请求二阶导数时才计算。
+        if 'hessian' in task and task['hessian']:
+            if hessian_mode == 'numeric':
+                # 数值模式使用 ASE Vibrations 对 3N 个坐标进行有限差分。
+                tmp_dir = tempfile.mkdtemp(prefix=f'calchess_{os.getpid()}_')
+                vib = Vibrations(atoms=atoms, name=os.path.join(tmp_dir, 'vib'), delta=0.005)
+                try:
+                    vib.run()
+                    vib_data = vib.get_vibrations()
+                    hessian = vib_data.get_hessian_2d() / (Hartree / (Bohr * Bohr))
+                finally:
+                    try:
+                        vib.clean()
+                    finally:
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
+            elif hessian_mode == 'analytic':
+                # 解析模式要求计算器实现 get_hessian。
+                H = calculator.get_hessian(atoms)  # May support vmap option in some calculators: H = calculator.get_hessian(atoms, vmap)
+                H = np.asarray(H)
+                N = len(atoms)
+                # 兼容常见轴排列，并统一为 (3N, 3N) 二维矩阵。
+                if H.shape == (N, 3, N, 3):
+                    hessian_2d = H.reshape(3*N, 3*N)
+                elif H.shape == (N, N, 3, 3):
+                    hessian_2d = H.transpose(0, 2, 1, 3).reshape(3*N, 3*N)
+                elif H.shape == (3, N, 3, N):
+                    hessian_2d = H.transpose(1, 0, 3, 2).reshape(3*N, 3*N)
+                elif H.shape == (3*N, N, 3):
+                    hessian_2d = H.reshape(3*N, 3*N)
+                elif H.shape == (3*N, 3*N):
+                    hessian_2d = H
+                else:
+                    raise ValueError(f"Unexpected Hessian shape: {H.shape}")
+                # 将 eV/Angstrom² 换算成 Eh/Bohr²。
+                hessian = hessian_2d / (Hartree / (Bohr * Bohr))
+            else:
+                raise ValueError(f"Unknown hessian_mode: {hessian_mode}")
+
+        else:
+            hessian = None
+
+        return {
+            'energy': energy,
+            'gradient': gradient,
+            'hessian' : hessian
+        }
+
+    except Exception as e:
+        return {'error': str(e)}
+
+
+def handle_connection(conn, exit_event, calculator, hessian_mode):
+    """处理一个请求/响应短连接，或消费 EXIT 控制消息。"""
+    with conn:
+        obj = recv_pickle(conn)
+        if obj is None:
+            return
+        if obj == 'PING':
+            send_pickle(conn, {'status': 'ok'})
+            return
+        if obj == 'EXIT':
+            exit_event.set()
+            return
+        result = process_task(obj, calculator, hessian_mode)
+        send_pickle(conn, result)
+
+
+def worker(server_socket, exit_event, model, backend, device, ready_queue, hessian_mode, num_gpu_workers, gpu_busy_count):
+    """加载 worker 专属模型，并参与共享 socket 的请求竞争与 GPU 优先调度。"""
+    try:
+        print(f'[worker {os.getpid()}] loading model={model} backend={backend} device={device}', file=sys.stderr, flush=True)
+        calculator, model_path, load_device = load_calculator(model, backend, device, hessian_mode)
+
+        ready_queue.put({
+            'status': 'ready',
+            'pid': os.getpid(),
+            'device': device,
+            'model_path': model_path,
+            'backend': backend,
+            'load_device': load_device,
+            'cuda_visible_devices': os.environ.get('CUDA_VISIBLE_DEVICES'),
+        })
+    except Exception as e:
+        ready_queue.put({
+            'status': 'error',
+            'pid': os.getpid(),
+            'device': device,
+            'model': model,
+            'error': repr(e),
+            'traceback': traceback.format_exc(),
+        })
+        raise
+
+    # 非阻塞 socket 配合 select，使 worker 能定期检查 exit_event 和调度条件。
+    server_socket.setblocking(False)
+
+    # 只要 GPU worker 尚有空闲，CPU worker 就短暂等待；GPU 全忙时 CPU 才参与接单。
+    while not exit_event.is_set():
+        try:
+            if should_wait_for_gpu(device, num_gpu_workers, gpu_busy_count.value):
+                time.sleep(0.01)
+                continue
+
+            ready, _, _ = select.select([server_socket], [], [], 0.1)
+            if not ready:
+                continue
+
+            try:
+                conn, _ = server_socket.accept()
+            except BlockingIOError:
+                continue
+            if device.startswith('cuda'):
+                # 计数从 accept 到响应结束，表示当前正在工作的 GPU worker 数。
+                with gpu_busy_count.get_lock():
+                    gpu_busy_count.value += 1
+            try:
+                handle_connection(conn, exit_event, calculator, hessian_mode)
+            finally:
+                if device.startswith('cuda'):
+                    with gpu_busy_count.get_lock():
+                        gpu_busy_count.value -= 1
+        except OSError:
+            break
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+
+
+def preflight_checks(args):
+    """在转入后台前检查模型文件和后端依赖，确保错误能直接显示给用户。
+
+    守护化后标准错误会进入日志，依赖缺失等错误不易被发现；因此把成本很低、
+    可以预判的检查放在前台执行。真正的模型加载仍由 worker 完成。
+    """
+    import importlib.util
+
+    if args.command != 'start':
+        return
+
+    # 模型路径错误无需启动后台进程即可发现。
+    model_path = resolve_model_path(args.model)
+    if not os.path.isfile(model_path):
+        sys.exit(f'[preflight] 模型文件不存在: {model_path}\n'
+                 f'         用 -m 指定路径，或设置 MLP_MODEL_DIR，或把模型放到 GMint 目录。')
+
+    # 分后端检查 Python 包；Orb 还要确认 checkpoint loader 与 Hessian 补丁。
+    required = ['numpy', 'torch', 'ase']
+    missing = [package for package in required if importlib.util.find_spec(package) is None]
+    if missing:
+        sys.exit(f'[preflight] 缺少基础依赖: {", ".join(missing)}')
+    if args.backend == 'orb':
+        try:
+            from orb_models.forcefield import pretrained
+        except ImportError:
+            sys.exit('[preflight] orb 后端需要 orb-models（GitHub main 分支）:\n'
+                     '  pip install "git+https://github.com/orbital-materials/orb-models.git"')
+        if not hasattr(pretrained, 'orbmol_v2'):
+            sys.exit('[preflight] 当前 orb-models 没有 orbmol_v2（需要 GitHub main 分支；'
+                     'PyPI 0.5.5 不支持 OrbMol-v2）。')
+        if args.hessian == 'analytic' and importlib.util.find_spec('orb_hessian') is None:
+            sys.exit('[preflight] --hessian analytic + orb 需要 orb-hessian 补丁包:\n'
+                     '  pip install "git+https://github.com/Senppoa/orb-hessian.git"\n'
+                     '  python -m orb_hessian install-pth\n'
+                     '         或改用默认的 --hessian numeric')
+    elif args.backend == 'fairchem' and importlib.util.find_spec('fairchem') is None:
+        sys.exit('[preflight] fairchem 后端未安装: pip install fairchem-core')
+    elif args.backend == 'mace' and importlib.util.find_spec('mace') is None:
+        sys.exit('[preflight] mace 后端未安装: pip install mace-torch')
+
+
+def main():
+    """解析 start/exit 命令，构建设备列表，并执行前台预检。"""
+    parser = argparse.ArgumentParser('mlp ase calculator server')
+    parser.add_argument('command', choices=['start', 'exit'])
+    parser.add_argument('--np', '-n', '-p', type=int, default=1)
+    parser.add_argument('--model', '-m', default='small')
+    parser.add_argument('--backend', '-b', choices=['mace', 'fairchem', 'orb'], default=None)
+    parser.add_argument('--gpu', '-g', nargs='?', const='auto', default=None, metavar='GPUS',
+                        help='使用 GPU 推理。可指定 GPU 列表如 -g 0,2,3；不传值则自动检测所有可用 GPU；'
+                             '不写 -g 则纯 CPU。也可用 CUDA_VISIBLE_DEVICES 限制可见 GPU')
+    parser.add_argument('--debug', '-d', action='store_true')
+    parser.add_argument('--foreground', action='store_true',
+                        help='不守护化，由批处理调度器管理服务和 worker 的进程组')
+    parser.add_argument('--startup-timeout', type=float, default=120,
+                        help='等待所有 worker 加载模型的秒数（默认 120）')
+    parser.add_argument('--hessian', choices=['numeric', 'analytic'], default='numeric')
+    parser.add_argument('--service', default=os.environ.get('MLP_SERVICE', 'default'),
+                        help='命名服务实例；客户端用相同名称路由任务（默认: %(default)s）')
+    args = parser.parse_args()
+
+    args.service = get_service_name(args.service)
+    if args.np < 1:
+        parser.error('--np/-n must be at least 1')
+    if args.startup_timeout <= 0:
+        parser.error('--startup-timeout must be positive')
+
+    if args.command == 'start' and args.backend is None:
+        parser.error('--backend/-b is required when using start')
+
+
+    # CUDA 上下文不宜通过 fork 继承；只要请求 GPU 就强制使用 spawn。
+    if args.gpu and args.command == 'start':
+        try:
+            multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass
+
+    preflight_checks(args)
+
+    if args.command == 'start':
+        try:
+            device_list = build_device_list(args.np, args.gpu)
+        except ValueError as e:
+            parser.error(str(e))
+    else:
+        device_list = []
+
+    if args.command == 'start':
+        try:
+            prepare_service_start(args.service)
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        start(num_workers=args.np, model=args.model, backend=args.backend,
+              device_list=device_list, error_logging=args.debug,
+              hessian_mode=args.hessian, service=args.service,
+              foreground=args.foreground, startup_timeout=args.startup_timeout)
+    elif args.command == 'exit':
+        send_exit(args.service)
+
+
+def start(num_workers, model, backend, device_list, error_logging, hessian_mode,
+          service='default', foreground=False, startup_timeout=120):
+    """创建守护进程、监听 socket 和设备 worker，并负责启动握手与退出清理。"""
+
+    # 无论是否传 -d，都记录 worker 启动信息；大模型加载失败时仍有日志可查。
+    error_log_file = get_service_log_file('mlps_error', service)
+    if not foreground:
+        daemonize(error_log_file=error_log_file)
+
+    # 在 spawn worker 前修正 Orb/Warp 在 WSL2 上的 CUDA 动态库搜索路径。
+    if backend == 'orb':
+        prepare_wsl_libcuda_env()
+
+    exit_event = multiprocessing.Event()
+    stop_signal = 0
+
+    if foreground:
+        def request_stop(signum, frame):
+            nonlocal stop_signal
+            stop_signal = signum
+
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # 端口 0 由系统分配空闲端口；仅绑定 localhost 也保护了不安全的 pickle 协议。
+    server_socket.bind(('localhost', 0))
+    port = server_socket.getsockname()[1]
+
+    server_socket.listen()
+
+    # GPU 模式下共享 busy 计数；CPU worker 据此判断是否应让 GPU 优先接单。
+    use_gpu = any(device.startswith('cuda') for device in device_list)
+    num_gpu_workers = sum(device.startswith('cuda') for device in device_list)
+
+    if use_gpu:
+        # use 'spawn' method to start
+        ctx = multiprocessing.get_context('spawn')
+        ready_queue = ctx.Queue()
+        gpu_busy_count = ctx.Value('i', 0)
+    else:
+        ready_queue = Queue()
+        gpu_busy_count = multiprocessing.Value('i', 0)
+
+    processes = []
+    for i in range(num_workers):
+        server_socket_fd = os.dup(server_socket.fileno())
+        device = device_list[i]
+        
+        if use_gpu:
+            p = ctx.Process(
+                target=worker,
+                args=(socket.socket(fileno=server_socket_fd), exit_event, model, backend, device, ready_queue, hessian_mode, num_gpu_workers, gpu_busy_count)
+            )
+        else:
+            p = multiprocessing.Process(
+                target=worker,
+                args=(socket.socket(fileno=server_socket_fd), exit_event, model, backend, device, ready_queue, hessian_mode, num_gpu_workers, gpu_busy_count)
+            )
+        p.start()
+        processes.append(p)
+
+    # 等每个 worker 通过 ready_queue 汇报模型已加载；失败或超时立即整体回收。
+    ready_workers = 0
+    startup_deadline = time.time() + startup_timeout
+    while ready_workers < num_workers:
+        if stop_signal:
+            abort_startup(processes, server_socket, ready_queue, exit_event, service,
+                          exit_code=128 + stop_signal)
+        try:
+            msg = ready_queue.get(timeout=0.2 if foreground else 5)
+        except Empty:
+            failed_processes = [
+                (p.pid, describe_worker_exitcode(p.exitcode))
+                for p in processes
+                if not p.is_alive() and p.exitcode is not None
+            ]
+            if failed_processes:
+                details = ', '.join(f'pid={pid}: {status}' for pid, status in failed_processes)
+                print(f'Worker failed during startup before signaling ready: {details}', file=sys.stderr, flush=True)
+                if error_log_file:
+                    print(f'See debug log: {error_log_file}', file=sys.stderr, flush=True)
+                abort_startup(processes, server_socket, ready_queue, exit_event, service)
+
+            stuck_processes = [
+                p.pid for p in processes
+                if p.is_alive() and p.exitcode is None
+            ]
+            if time.time() >= startup_deadline:
+                details = ', '.join(str(pid) for pid in stuck_processes) or 'unknown'
+                print(f'Worker startup timed out after {startup_timeout} seconds; still waiting on pid(s): {details}', file=sys.stderr, flush=True)
+                if error_log_file:
+                    print(f'See debug log: {error_log_file}', file=sys.stderr, flush=True)
+                abort_startup(processes, server_socket, ready_queue, exit_event, service)
+            continue
+
+        if isinstance(msg, dict):
+            if msg.get('status') == 'ready':
+                ready_workers += 1
+                print(
+                    f"Worker ready: pid={msg.get('pid')} device={msg.get('device')} backend={msg.get('backend')} load_device={msg.get('load_device')} cuda_visible_devices={msg.get('cuda_visible_devices')} path={msg.get('model_path')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if msg.get('status') == 'error':
+                print(
+                    f"Worker startup error: pid={msg.get('pid')} device={msg.get('device')} model={msg.get('model')} error={msg.get('error')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(msg.get('traceback', ''), file=sys.stderr, flush=True)
+                abort_startup(processes, server_socket, ready_queue, exit_event, service)
+
+        print(f'Unexpected message from worker: {msg}', file=sys.stderr, flush=True)
+        abort_startup(processes, server_socket, ready_queue, exit_event, service)
+
+    # 所有 worker 就绪后才发布端口文件，客户端看到文件即可安全发送任务。
+    save_port_file(port, os.getpid(), service, {
+        'backend': backend,
+        'model': model,
+        'workers': num_workers,
+        'devices': device_list,
+    })
+
+    # 任一 worker 收到 EXIT 后设置事件，父进程再统一终止并回收全部 worker。
+    while not exit_event.wait(timeout=0.2):
+        if stop_signal:
+            break
+    for p in processes:
+        p.terminate()
+        p.join(timeout=10)
+        if p.is_alive():
+            print(f'Worker did not exit after terminate: pid={p.pid}; killing it', file=sys.stderr, flush=True)
+            p.kill()
+            p.join(timeout=5)
+
+    server_socket.close()
+    remove_port_file(service)
+
+
+def send_exit(service='default'):
+    """发送 EXIT 控制消息，并等待 daemon、worker 与监听端口完全退出。"""
+    port = get_port_number(service)
+    daemon_pid = get_server_pid(service)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect(('localhost', port))
+            send_pickle(s, 'EXIT')
+    except Exception as e:
+        print(f'Error in send exit message to calculator: {e}')
+        remove_port_file(service)
+        sys.exit(1)
+
+    # 等待 socket 关闭、worker 消失和 GPU 显存释放，而不是发完消息立即返回。
+    if wait_for_server_down(port, timeout=30):
+        wait_for_pid_gone(daemon_pid, timeout=10)
+        remove_port_file(service)
+    else:
+        # 超时一般表示 worker 卡在后端/CUDA 调用中，使用进程组强杀作为兜底。
+        print(f'Server did not shut down within 30s; force-killing process group '
+              f'(daemon pid={daemon_pid})', file=sys.stderr, flush=True)
+        force_kill_server(daemon_pid)
+        wait_for_server_down(port, timeout=5)
+        remove_port_file(service)
+
+
+if __name__ == '__main__':
+    main()
